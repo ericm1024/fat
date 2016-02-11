@@ -72,19 +72,21 @@ struct packed fat_superblock {
 #define FAT_NAME_LEN (22)
 
 /* dentry flags */
-#define FAT_DF_RUSR    (0x1u << 0)
-#define FAT_DF_WUSR    (0x1u << 1)
-#define FAT_DF_XUSR    (0x1u << 2)
-#define FAT_DF_RGRP    (0x1u << 3)
+#define FAT_DF_XOTH    (0x1u << 0)
+#define FAT_DF_WOTH    (0x1u << 1)
+#define FAT_DF_ROTH    (0x1u << 2)
+#define FAT_DF_XGRP    (0x1u << 3)
 #define FAT_DF_WGRP    (0x1u << 4)
-#define FAT_DF_XGRP    (0x1u << 5)
-#define FAT_DF_ROTH    (0x1u << 6)
-#define FAT_DF_WOTH    (0x1u << 7)
-#define FAT_DF_XOTH    (0x1u << 8)
+#define FAT_DF_RGRP    (0x1u << 5)
+#define FAT_DF_XUSR    (0x1u << 6)
+#define FAT_DF_WUSR    (0x1u << 7)
+#define FAT_DF_RUSR    (0x1u << 8)
 #define FAT_DF_FILE    (0x1u << 9)  /* dentry is a file */
 #define FAT_DF_DENTRY  (0x1u << 10) /* dentry is another dentry */
 #define FAT_DF_DEL     (0x1u << 11) /* dentry has been deleted */
 #define FAT_DF_LAST    (0x1u << 12) /* last dentry in dirrectory */
+
+#define FAT_DF_STAT_MASK ((1 << 9) - 1) /* mask for stat->st_mode */
 
 /*
  * on-disk fat directory entry
@@ -447,8 +449,8 @@ static int fat_read_cluster(struct fat_cluster *cluster,
  * 
  * This function is implemented recursively.
  */ 
-static int fat_get_dentry(const char *path, const struct fat_dentry *parent,
-                          const struct fat_fs *fs, struct fat_dentry *out_d)
+static int __fat_get_dentry(const char *path, const struct fat_dentry *parent,
+                            const struct fat_fs *fs, struct fat_dentry *out_d)
 {
         struct fat_cluster cluster;
 
@@ -489,7 +491,7 @@ static int fat_get_dentry(const char *path, const struct fat_dentry *parent,
                                                   i);
                                         return 0;
                                 }
-                                return fat_get_dentry(path, d, fs, out_d);
+                                return __fat_get_dentry(path, d, fs, out_d);
                         }
                 }
 
@@ -507,6 +509,13 @@ static int fat_get_dentry(const char *path, const struct fat_dentry *parent,
                 }
                 cluster.c_idx = next_idx;
         }
+}
+
+/* see __fat_get_dentry */
+static int fat_get_dentry(const char *path, const struct fat_fs *fs,
+                          struct fat_dentry *out_d)
+{
+        return __fat_get_dentry(path, NULL, fs, out_d);
 }
 
 /*
@@ -738,7 +747,30 @@ out_err:
 
 static int fat_getattr(const char *path, struct stat *stbuf)
 {
-        return -ENOSYS;
+        int err;
+        struct fat_dentry dentry;
+
+        fat_trace("%s: path=%s", path);
+
+        err = fat_get_dentry(path, &global_fat_fs, &dentry);
+        if (err)
+                return err;
+
+        memset(stbuf, 0, sizeof *stbuf);
+        stbuf->st_mode = dentry.d_flags & FAT_DF_STAT_MASK;
+        if (fat_dentry_is_file(&dentry)) {
+                stbuf->st_nlink = 1;
+                stbuf->st_size = dentry.d_fsize;
+        } else {
+                stbuf->st_nlink = 2;
+                /* XXX: should be size of all child dentries? */
+                stbuf->st_size = FAT_BLOCK_SIZE;
+        }
+
+        stbuf->st_blksize = FAT_CLUSTER_SIZE;
+        stbuf->st_blocks = (stbuf->st_size + FAT_BLOCK_SIZE - 1)/FAT_BLOCK_SIZE;
+
+        return 0;
 }
 
 static int fat_access(const char *path, int mask)
