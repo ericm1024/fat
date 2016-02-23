@@ -33,6 +33,7 @@
 #include <fuse.h>
 #include <stdarg.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -155,10 +156,18 @@ struct fat_fs {
 static struct fat_fs global_fat_fs;
 
 /*
+ * this makes the compiler type-check format strings for functions that
+ * behave like printf, because frankly I always mess them up.
+ * eg, before I included this, my code was segfaulting
+ */ 
+#define __printf_like(fmt, args) \
+        __attribute__((format(printf, fmt, args)))
+
+/*
  * common error reporting function in case we ever want to write to a log
  * file or something fancy
  */ 
-static void fat_error(const char *fmt, ...)
+static void __printf_like(1, 2) fat_error(const char *fmt, ...)
 {
         va_list args;
         va_start(args, fmt);
@@ -171,7 +180,7 @@ static void fat_error(const char *fmt, ...)
  * common tracing function so we can enable/disable tracing based on
  * compliation/runtime arguments
  */ 
-static void fat_trace(const char *fmt, ...)
+static void __printf_like(1, 2) fat_trace(const char *fmt, ...)
 {
         va_list args;
         va_start(args, fmt);
@@ -183,7 +192,7 @@ static void fat_trace(const char *fmt, ...)
 /* is this cluster number actually allocated in the fat? */ 
 static bool fat_cluster_is_allocated(const struct fat_fs *fs, uint32_t idx)
 {
-        assert(idx <= fs->f_sb->s_fat_entries);
+        assert(idx < fs->f_sb->s_fat_entries);
         return fs->f_fat[idx] != FAT_FREE_MARK;
 }
 
@@ -209,6 +218,18 @@ static bool fat_dentry_is_del(const struct fat_dentry *d)
 static bool fat_dentry_is_last(const struct fat_dentry *d)
 {
         return d->d_flags & FAT_DF_LAST;
+}
+
+/* clear a dentry flag */
+static void fat_dentry_clear_flag(uint16_t flag, struct fat_dentry *d)
+{
+        d->d_flags &= ~flag;
+}
+
+/* set a dentry flag */
+static void fat_dentry_set_flag(uint16_t flag, struct fat_dentry *d)
+{
+        d->d_flags |= flag;
 }
 
 /* follow a chain in the fat */
@@ -356,7 +377,7 @@ static int __fat_write_blocks(off_t offset, int fd, size_t size,
                 fat_error("%s: pwrite failed with %s", __func__,
                           strerror(errno));
         } else if ((size_t)ret < size) {
-                fat_error("%s: short pwrite at offset=%ld. size=%ld",
+                fat_error("%s: short pwrite at offset=%ld size=%ld",
                           __func__, offset, ret);
                 err = -EIO; /* XXX: better error? */
         }
@@ -373,7 +394,7 @@ static int __fat_write_blocks(off_t offset, int fd, size_t size,
  *
  * @returns 0 on success, negative values on error.
  */ 
-static int fat_write_blocks(off_t offset, struct fat_fs *fs,
+static int fat_write_blocks(off_t offset, const struct fat_fs *fs,
                             size_t size, const void *block)
 {
         return __fat_write_blocks(offset, fs->f_fd, size, block);
@@ -409,7 +430,7 @@ static int fat_read_blocks(off_t offset, const struct fat_fs *fs,
                 fat_error("%s: pread failed with %s", __func__,
                           strerror(errno));
         } else if ((size_t)ret < size) {
-                fat_error("%s: short pread at offset=%ld. size=%ld",
+                fat_error("%s: short pread at offset=%ld size=%ld",
                           __func__, offset, ret);
                 err = -EIO; /* XXX: better error? */
         }
@@ -435,6 +456,26 @@ static int fat_read_cluster(struct fat_cluster *cluster,
         if (!fat_cluster_is_allocated(fs, cluster->c_idx))
                 return -ENOENT;
         return fat_read_blocks(offset, fs, FAT_CLUSTER_SIZE, &cluster->c_fbuf);
+}
+
+/*
+ * write a single cluster to the data segment of a fat filesystem
+ *
+ * @cluster  The cluster to write
+ * @fs       fat instance to write to
+ *
+ * @returns 0 on success, ngative errors on falure
+ */ 
+static int fat_write_cluster(struct fat_cluster *cluster,
+                             const struct fat_fs *fs)
+{
+        off_t offset = sizeof(struct fat_superblock)
+                + sizeof(uint32_t)*fs->f_sb->s_fat_entries
+                + FAT_CLUSTER_SIZE*cluster->c_idx;
+
+        if (!fat_cluster_is_allocated(fs, cluster->c_idx))
+                return -ENOENT;
+        return fat_write_blocks(offset, fs, FAT_CLUSTER_SIZE, &cluster->c_fbuf);
 }
 
 /*
@@ -537,6 +578,10 @@ static int fat_mkfs(int fd, size_t size)
                 ((size - FAT_BLOCK_SIZE)  
                  /(entries_per_block*(sizeof(uint32_t)+FAT_CLUSTER_SIZE)))
                  * entries_per_block;
+        struct fat_cluster cluster;
+        struct fat_dentry *root_dentry;
+
+        fat_trace("%s: called", __func__);
 
         /*
          * XXX: currently we just choose the number of entries in the FAT
@@ -554,7 +599,8 @@ static int fat_mkfs(int fd, size_t size)
                nr_fat_entries*(FAT_CLUSTER_SIZE + sizeof(uint32_t))
                <= FAT_DEFAULT_FS_SIZE);
 
-        fat_trace("%s: fs_size=%u, nr_fat_entries=%u", size, nr_fat_entries);
+        fat_trace("%s: fs_size=%zu, nr_fat_entries=%u", __func__, size,
+                  nr_fat_entries);
 
         err = ftruncate(fd, size);
         if (err)
@@ -570,12 +616,32 @@ static int fat_mkfs(int fd, size_t size)
         sb->s_last_allocd = 0;
         sb->s_fat_entries = nr_fat_entries;
 
+        fat_trace("%s: about to write superblock", __func__);
+        
         err = __fat_write_blocks(0, fd, FAT_BLOCK_SIZE, sb);
         if (err)
                 return err;
 
-        /* XXX: allocate root dentry? */
-        return 0;
+        /*
+         * write the root dentry. we have to do this "by hand" because
+         * the generic dentry-writing function requires a struct fat_fs,
+         * which we don't have yet
+         */
+        memset(&cluster, 0, sizeof cluster);
+        root_dentry = &cluster.c_dentries[0];
+        root_dentry->d_name[0] = '/';
+        root_dentry->d_name[1] = '\0';
+        fat_dentry_set_flag(FAT_DF_LAST, root_dentry);
+        fat_dentry_set_flag(FAT_DF_DENTRY, root_dentry);
+        root_dentry->d_idx = FAT_END_MARK;
+        root_dentry->d_fsize = 0;
+
+        fat_trace("%s: about to write root dentry", __func__);
+
+        return __fat_write_blocks(nr_fat_entries*sizeof(uint32_t)
+                                  + FAT_BLOCK_SIZE, fd,
+                                  sizeof cluster.c_dentries,
+                                  &cluster.c_dentries);
 }
 
 /*
@@ -633,7 +699,7 @@ static int fat_fill_fs(const char *bfile_name, struct fat_fs *fs)
                                   bfile_name, strerror(errno));
                         goto out_err;
                 }
-                fd = open(bfile_name, O_RDWR|O_CREAT, 0644);
+                fd = open(bfile_name, O_RDWR|O_CREAT|O_EXCL, 0644);
                 if (fd < 0) {
                         err = -errno;
                         fat_error("%s: could not open %s for creation: %s",
@@ -682,7 +748,7 @@ static int fat_fill_fs(const char *bfile_name, struct fat_fs *fs)
         fat = malloc(fat_size);
         if (!fat) {
                 err = -ENOMEM;
-                fat_error("%s: failed to allocate fat of size %zu",
+                fat_error("%s: failed to allocate fat of size %u",
                           __func__, fat_size);
                 goto out_free_sb;
         }
@@ -699,7 +765,7 @@ static int fat_fill_fs(const char *bfile_name, struct fat_fs *fs)
         flist_vec = malloc(flist_cap * sizeof *flist_vec);
         if (!flist_vec) {
                 err = -ENOMEM;
-                fat_error("%s: failed to allocate freelist of size %zu",
+                fat_error("%s: failed to allocate freelist of size %u",
                           __func__, flist_cap);
                 goto out_free_fat;
         }
@@ -745,12 +811,162 @@ out_err:
         return err;
 }
 
+/*
+ * Commit a change to the fat, i.e. change the value at an index to a new
+ * value and commit it to stable storage.
+ *
+ * @idx   The index in the fat to change.
+ * @new   The new value to write at that index.
+ * @fs    The filesystem instance to modify.
+ *
+ * @return We don't return anything here because it's difficult to
+ * reason about what to "un-modify" if a IO fails during a fat modification,
+ * so if an IO does fail we just yell loudly
+ */ 
+static void fat_modify_fat(uint32_t idx, uint32_t new, struct fat_fs *fs)
+{
+        int ret;
+        ptrdiff_t fat_off = FAT_BLOCK_SIZE*((idx*sizeof idx)/FAT_BLOCK_SIZE);
+        off_t file_off = fat_off + FAT_BLOCK_SIZE; /* account for sb */
+        assert(idx < fs->f_sb->s_fat_entries);
+
+        fat_trace("%s: committing fat change at idx=%u: old=%u, new=%u, "
+                  "file_off=%lu", __func__, idx, fs->f_fat[idx],
+                  new, file_off);
+
+        fs->f_fat[idx] = new;
+        ret = fat_write_blocks(file_off, fs, FAT_BLOCK_SIZE,
+                               (uint8_t *)fs->f_fat + fat_off);
+
+        /* XXX: don't be lazy here, actually handle this */
+        if (ret)
+                fat_error("%s: write failed. This error is unhandled!",
+                          __func__);
+}
+
+/*
+ * Allocate a cluster on-disk and return the index of the new allocated
+ * cluster.
+ *
+ * @parent   The index of the previous cluster in the chain, or FAT_END_MARK
+ *           if this is the first cluster in the chain.
+ * @fs       The filesystem instance to allocate in.
+ * @out      The cluster we allocated, read into here.
+ *
+ * @returns 0 on success, negative values on error 
+ */
+static int fat_alloc_get_cluster(uint32_t parent, struct fat_fs *fs,
+                                 struct fat_cluster *out)
+{
+        uint32_t new_cl;
+
+        if (!fat_has_free_clusters(fs))
+                return -ENOSPC;
+
+        new_cl = fat_flist_pop(fs);
+        fat_modify_fat(new_cl, FAT_END_MARK, fs);
+
+        if (parent != FAT_END_MARK) {
+                assert(fat_cluster_is_allocated(fs, parent));
+                fat_modify_fat(parent, new_cl, fs);
+        }
+
+        return fat_read_cluster(out, fs);
+}
+
+/*
+ * allocate space for and commit a new dentry given a parent dentry.
+ *
+ * @dentry   The dentry to write.
+ * @parent   The parent dentry, or NULL if we're writing the root.
+ * @fs       The fat filesystem instance to operate on.
+ *
+ * @returns 0 on success, negative values on error, 1 if the parent
+ * dentry needs to be committed to disk.
+ *
+ * xxx: this function is horrible and I'm not proud of it
+ */ 
+static int fat_write_new_dentry(struct fat_dentry *dentry,
+                                struct fat_dentry *parent,
+                                struct fat_fs *fs)
+{
+        int ret;
+        struct fat_cluster cluster, new_cluster;
+
+        cluster.c_idx = parent ? parent->d_idx : 0;
+        cluster.c_is_file = false;
+        new_cluster.c_is_file = false;
+
+        /* dentry points to nothing, i.e. dir is empty */
+        if (cluster.c_idx == FAT_END_MARK) {
+                ret = fat_alloc_get_cluster(cluster.c_idx, fs, &cluster);
+                if (ret)
+                        return ret;
+
+                parent->d_idx = cluster.c_idx;
+                fat_dentry_set_flag(FAT_DF_LAST, dentry);
+                cluster.c_dentries[0] = *dentry;
+                ret = fat_write_cluster(&cluster, fs);
+                if (ret)
+                        return ret;
+
+                /* we changed parents d->d_idx, so it needs to be written */
+                return 1;
+        }
+        
+        for (;;) {
+                unsigned c_idx;
+                ret = fat_read_cluster(&cluster, fs);
+                if (ret)
+                        return ret;
+
+                for (c_idx = 0; c_idx < DENTRIES_PER_CLUSTER; ++c_idx) {
+                        struct fat_dentry *d = &cluster.c_dentries[c_idx];
+
+                        if (fat_dentry_is_del(d)) {
+                                *d = *dentry;
+                                return fat_write_cluster(&cluster, fs);
+                        } else if (!fat_dentry_is_last(d))
+                                continue;
+
+                        /* we got to the last dentry in the directory */
+
+                        fat_dentry_set_flag(FAT_DF_LAST, dentry);
+                        
+                        /* do we need to allocate a new cluster for this
+                         * directory? */
+                        if (c_idx == DENTRIES_PER_CLUSTER - 1) {
+                                ret = fat_alloc_get_cluster(cluster.c_idx, fs,
+                                                            &new_cluster);
+                                if (ret)
+                                        return ret;
+
+                                new_cluster.c_dentries[0] = *dentry;
+                                ret = fat_write_cluster(&new_cluster, fs);
+                                if (ret)
+                                        /* XXX: leaking a cluster here? */
+                                        return ret;
+                        } else {
+                                cluster.c_dentries[c_idx+1] = *dentry;
+                        }
+
+                        fat_dentry_clear_flag(FAT_DF_LAST, d);
+                        return fat_write_cluster(&cluster, fs);
+                }
+                cluster.c_idx = fat_follow_chain(cluster.c_idx, fs);
+        }
+
+        /* unreachable */
+        assert(false);
+        return -EINVAL;
+}                            
+
 static int fat_getattr(const char *path, struct stat *stbuf)
 {
         int err;
         struct fat_dentry dentry;
 
-        fat_trace("%s: path=%s", path);
+        fat_trace("%s: path=%s", __func__, path);
 
         err = fat_get_dentry(path, &global_fat_fs, &dentry);
         if (err)

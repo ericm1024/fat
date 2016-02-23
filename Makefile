@@ -9,7 +9,7 @@ all: $(TARGET)
 
 clean: unmount
 	rm -f $(TARGET)
-	rmdir $(MNT_DIR)
+	-rmdir $(MNT_DIR)
 
 unmount:
 	-fusermount -u $(MNT_DIR)
