@@ -22,4 +22,4 @@ mount: $(TARGET) $(MNT_DIR) unmount
 	./$(TARGET) -s $(MNT_DIR)
 
 $(MNT_DIR):
-	mkdir -p $(MNT_DIR)
+	-mkdir -p $(MNT_DIR)

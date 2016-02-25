@@ -70,7 +70,7 @@ struct packed fat_superblock {
 };
 
 /* maximum filename length. Chosen so dentry size divides block size */
-#define FAT_NAME_LEN (22)
+#define FAT_NAME_LEN (18)
 
 /* dentry flags */
 #define FAT_DF_XOTH    (0x1u << 0)
@@ -96,12 +96,16 @@ struct packed fat_superblock {
  * @d_flags   dentry flags, a la FAT_DF_*
  * @d_idx     cluster index of the object described by this dentry
  * @d_fsize   if this dentry describes a file, the field holds its size
+ * @d_uid     user id of object
+ * @d_gid     group id of object
  */ 
 struct packed fat_dentry {
         char d_name[FAT_NAME_LEN];
         uint16_t d_flags;
         uint32_t d_idx;
         uint32_t d_fsize;
+        uint16_t d_uid;
+        uint16_t d_gid;
 };
 
 #define DENTRIES_PER_CLUSTER (FAT_CLUSTER_SIZE/sizeof(struct fat_dentry))
@@ -153,6 +157,17 @@ struct fat_fs {
         int f_fd;
 };
 
+/*
+ * dentry iterator
+ */ 
+struct fat_diter {
+        struct fat_fs *di_fs;
+        struct fat_cluster *di_cluster;
+        unsigned di_d_index;
+};
+
+static int fat_alloc_cluster(uint32_t parent, struct fat_fs *fs, uint32_t *out);
+
 static struct fat_fs global_fat_fs;
 
 /*
@@ -192,8 +207,8 @@ static void __printf_like(1, 2) fat_trace(const char *fmt, ...)
 /* is this cluster number actually allocated in the fat? */ 
 static bool fat_cluster_is_allocated(const struct fat_fs *fs, uint32_t idx)
 {
-        assert(idx < fs->f_sb->s_fat_entries);
-        return fs->f_fat[idx] != FAT_FREE_MARK;
+        return idx < fs->f_sb->s_fat_entries
+                && fs->f_fat[idx] != FAT_FREE_MARK;
 }
 
 /* is this dentry a file? */
@@ -466,7 +481,7 @@ static int fat_read_cluster(struct fat_cluster *cluster,
  *
  * @returns 0 on success, ngative errors on falure
  */ 
-static int fat_write_cluster(struct fat_cluster *cluster,
+static int fat_write_cluster(const struct fat_cluster *cluster,
                              const struct fat_fs *fs)
 {
         off_t offset = sizeof(struct fat_superblock)
@@ -478,8 +493,88 @@ static int fat_write_cluster(struct fat_cluster *cluster,
         return fat_write_blocks(offset, fs, FAT_CLUSTER_SIZE, &cluster->c_fbuf);
 }
 
+static int fat_diter_begin(struct fat_diter *di,
+                           const struct fat_dentry *parent)
+{
+        int ret;
+        uint32_t d_idx = parent ? parent->d_idx : 0;
+
+        di->di_cluster = malloc(sizeof *di->di_cluster);
+        if (!di->di_cluster)
+                return -ENOMEM;
+        memset(di->di_cluster, 0, sizeof *di->di_cluster);
+        if (!fat_cluster_is_allocated(di->di_fs, d_idx)) {
+                free(di->di_cluster);
+                return -ENOENT;
+        }
+        di->di_cluster->c_idx = d_idx;
+        di->di_cluster->c_is_file = false;
+        ret = fat_read_cluster(di->di_cluster, di->di_fs);
+        if (ret) {
+                free(di->di_cluster);
+                return ret;
+        }
+        di->di_d_index = 0;
+        return 0;
+}
+
+static struct fat_dentry *fat_diter_get(const struct fat_diter *di)
+{
+        return &di->di_cluster->c_dentries[di->di_d_index];
+}
+
+static int fat_diter_advance(struct fat_diter *di)
+{
+        struct fat_dentry *d = fat_diter_get(di);
+        int ret;
+        if (fat_dentry_is_last(d))
+                return -ENOENT;
+        if (di->di_d_index < DENTRIES_PER_CLUSTER - 1) {
+                di->di_d_index++;
+                return 0;
+        }
+        di->di_cluster->c_idx = fat_follow_chain(di->di_cluster->c_idx,
+                                                 di->di_fs);
+        ret = fat_read_cluster(di->di_cluster, di->di_fs);
+        if (ret)
+                return ret;
+        di->di_d_index = 0;
+        return 0;
+}
+
+static void fat_diter_end(struct fat_diter *di)
+{
+        free(di->di_cluster);
+        di->di_cluster = NULL;
+}
+
+static int fat_diter_clone(const struct fat_diter *parent,
+                           struct fat_diter *child)
+{
+        size_t csize = sizeof *child->di_cluster;
+        child->di_fs = parent->di_fs;
+        child->di_d_index = parent->di_d_index;
+        child->di_cluster = malloc(csize);
+        if (!child->di_cluster)
+                return -ENOMEM;
+        memcpy(child->di_cluster, parent->di_cluster, csize);
+        return 0;
+}
+
+static int fat_diter_alloc_cluster(struct fat_diter *diter)
+{
+        assert(diter->di_d_index == DENTRIES_PER_CLUSTER - 1);
+        assert(fat_dentry_is_last(fat_diter_get(diter)));
+        return fat_alloc_cluster(diter->di_cluster->c_idx, diter->di_fs, NULL);
+}
+
+static int fat_diter_commit(const struct fat_diter *diter)
+{
+        return fat_write_cluster(diter->di_cluster, diter->di_fs);
+}
+
 /*
- * Lookup a dentry corresponding to path, starting at parent.
+ * Lookup a dentry itterator corresponding to path, starting at parent.
  *
  * @path     path to lookup dentry for. should start with a '/'
  * @parent   parent dentry if already looked up, can be NULL
@@ -490,74 +585,64 @@ static int fat_write_cluster(struct fat_cluster *cluster,
  * 
  * This function is implemented recursively.
  */ 
-static int __fat_get_dentry(const char *path, const struct fat_dentry *parent,
-                            const struct fat_fs *fs, struct fat_dentry *out_d)
+static int __fat_get_diter(const char *path, const struct fat_dentry *parent,
+                           struct fat_fs *fs, struct fat_diter *out_d)
 {
-        struct fat_cluster cluster;
-
-        cluster.c_is_file = false;
-        cluster.c_idx = parent ? parent->d_idx : 0;
+        struct fat_diter diter;
+        int err;
 
         fat_trace("%s: path='%s', parent=%p", __func__, path, (void*)parent);
-        
         if (!*path || *path != '/')
                 return -EINVAL;
 
-        for (;;) {
-                unsigned i;
-                int err;
-                uint32_t next_idx;
+        diter.di_fs = fs;
+        err = fat_diter_begin(&diter, parent);
+        if (err)
+                return err;
 
-                /* read the next cluster of dentries in this directory */
-                err = fat_read_cluster(&cluster, fs);
+        for (;;) {
+                struct fat_dentry *d = fat_diter_get(&diter);
+
+                if (!fat_dentry_is_del(d)
+                    && fat_path_matches_dentry(path, d)) {
+                        if (!fat_path_eat_level(&path)) {
+                                *out_d = diter;
+                                fat_trace("%s: found dentry in cluster=%u, "
+                                          "dname=%s, index=%u", __func__,
+                                          diter.di_cluster->c_idx,
+                                          d->d_name, diter.di_d_index);
+                                return 0;
+                        }
+                        err = __fat_get_diter(path, d, fs, out_d);
+                        fat_diter_end(&diter);
+                        return err;
+                }
+                
+                err = fat_diter_advance(&diter);
                 if (err)
                         return err;
-
-                /* look for a dentry in the cluster that matches @path */
-                for (i = 0; i < DENTRIES_PER_CLUSTER; ++i) {
-                        struct fat_dentry *d = &cluster.c_dentries[i];
-                        
-                        if (fat_dentry_is_last(d))
-                                return -ENOENT;
-                        else if (fat_dentry_is_del(d))
-                                continue;
-
-                        if (fat_path_matches_dentry(path, d)) {
-                                if (!fat_path_eat_level(&path)) {
-                                        *out_d = *d;
-                                        fat_trace("%s: found dentry in "
-                                                  "cluster=%u, dname=%s, "
-                                                  "index=%u", __func__,
-                                                  cluster.c_idx, d->d_name,
-                                                  i);
-                                        return 0;
-                                }
-                                return __fat_get_dentry(path, d, fs, out_d);
-                        }
-                }
-
-                next_idx = fat_follow_chain(cluster.c_idx, fs);
-                /*
-                 * we shouldn't need the fat to tell us that we got to the
-                 * end of a directory. the last dentry should be marked as
-                 * last, so the above loop should catch it. thus if we get
-                 * here, we have a bug.
-                 */ 
-                if (next_idx == FAT_END_MARK) {
-                        fat_error("%s: directory has no last dentry. idx=%d",
-                                  __func__, cluster.c_idx);
-                        return -EIO; /* XXX: better error? or panic? */
-                }
-                cluster.c_idx = next_idx;
         }
 }
 
-/* see __fat_get_dentry */
-static int fat_get_dentry(const char *path, const struct fat_fs *fs,
-                          struct fat_dentry *out_d)
+/* see __fat_get_diter */
+static int fat_get_diter(const char *path, struct fat_fs *fs,
+                         struct fat_diter *out)
 {
-        return __fat_get_dentry(path, NULL, fs, out_d);
+        return __fat_get_diter(path, NULL, fs, out);
 }
+
+static int fat_get_dentry(const char *path, struct fat_fs *fs,
+                          struct fat_dentry *out)
+{
+        struct fat_diter diter;
+        int err = fat_get_diter(path, fs, &diter);
+        if (err)
+                return err;
+        *out = *fat_diter_get(&diter);
+        fat_diter_end(&diter);
+        return 0;
+}
+        
 
 /*
  * initialize a file to look like a fat filesystem, i.e. truncate the file,
@@ -580,6 +665,7 @@ static int fat_mkfs(int fd, size_t size)
                  * entries_per_block;
         struct fat_cluster cluster;
         struct fat_dentry *root_dentry;
+        uint32_t fat_block[FAT_BLOCK_SIZE/sizeof(uint32_t)];
 
         fat_trace("%s: called", __func__);
 
@@ -612,7 +698,7 @@ static int fat_mkfs(int fd, size_t size)
 
         memset(sb, 0, sizeof *sb);
         sb->s_magic = FAT_SB_MAGIC;
-        sb->s_free = nr_fat_entries;
+        sb->s_free = nr_fat_entries - 1;
         sb->s_last_allocd = 0;
         sb->s_fat_entries = nr_fat_entries;
 
@@ -625,23 +711,32 @@ static int fat_mkfs(int fd, size_t size)
         /*
          * write the root dentry. we have to do this "by hand" because
          * the generic dentry-writing function requires a struct fat_fs,
-         * which we don't have yet
+         * which we don't have yet. In the same vein, we have to mark this
+         * cluster in the fat as allocated
          */
         memset(&cluster, 0, sizeof cluster);
         root_dentry = &cluster.c_dentries[0];
-        root_dentry->d_name[0] = '/';
-        root_dentry->d_name[1] = '\0';
-        fat_dentry_set_flag(FAT_DF_LAST, root_dentry);
-        fat_dentry_set_flag(FAT_DF_DENTRY, root_dentry);
+        root_dentry->d_name[0] = '\0';
+        fat_dentry_set_flag(FAT_DF_LAST|FAT_DF_DENTRY|FAT_DF_XOTH|
+                            FAT_DF_ROTH|FAT_DF_XGRP|FAT_DF_RGRP|FAT_DF_XUSR|
+                            FAT_DF_WUSR|FAT_DF_RUSR, root_dentry);
         root_dentry->d_idx = FAT_END_MARK;
         root_dentry->d_fsize = 0;
+        /* xxx: is this the uid and gid we want? */
+        root_dentry->d_uid = getuid();
+        root_dentry->d_gid = getgid();
 
-        fat_trace("%s: about to write root dentry", __func__);
+        err = __fat_write_blocks(nr_fat_entries*sizeof(uint32_t)
+                                 + FAT_BLOCK_SIZE, fd,
+                                 sizeof cluster.c_dentries,
+                                 &cluster.c_dentries);
+        if (err)
+                return err;
 
-        return __fat_write_blocks(nr_fat_entries*sizeof(uint32_t)
-                                  + FAT_BLOCK_SIZE, fd,
-                                  sizeof cluster.c_dentries,
-                                  &cluster.c_dentries);
+        memset(fat_block, 0, sizeof fat_block);
+        fat_block[0] = FAT_END_MARK;
+        return __fat_write_blocks(FAT_BLOCK_SIZE, fd, FAT_BLOCK_SIZE,
+                                  fat_block);
 }
 
 /*
@@ -828,11 +923,22 @@ static void fat_modify_fat(uint32_t idx, uint32_t new, struct fat_fs *fs)
         int ret;
         ptrdiff_t fat_off = FAT_BLOCK_SIZE*((idx*sizeof idx)/FAT_BLOCK_SIZE);
         off_t file_off = fat_off + FAT_BLOCK_SIZE; /* account for sb */
+        uint32_t old = fs->f_fat[idx];
         assert(idx < fs->f_sb->s_fat_entries);
 
         fat_trace("%s: committing fat change at idx=%u: old=%u, new=%u, "
                   "file_off=%lu", __func__, idx, fs->f_fat[idx],
                   new, file_off);
+
+        /*
+         * if the old value we're colbbering in the fat was a cluster index
+         * and the new value is also a cluster index, we're probably
+         * clobering something we shouldn't, so yell loudly.
+         */
+        if (old != FAT_FREE_MARK && old != FAT_END_MARK &&
+            new != FAT_FREE_MARK && new != FAT_END_MARK &&
+            new != FAT_BAD_MARK)
+                fat_error("%s: possible cluster leakage", __func__);
 
         fs->f_fat[idx] = new;
         ret = fat_write_blocks(file_off, fs, FAT_BLOCK_SIZE,
@@ -851,12 +957,11 @@ static void fat_modify_fat(uint32_t idx, uint32_t new, struct fat_fs *fs)
  * @parent   The index of the previous cluster in the chain, or FAT_END_MARK
  *           if this is the first cluster in the chain.
  * @fs       The filesystem instance to allocate in.
- * @out      The cluster we allocated, read into here.
+ * @out      The cluster number we allocated
  *
  * @returns 0 on success, negative values on error 
  */
-static int fat_alloc_get_cluster(uint32_t parent, struct fat_fs *fs,
-                                 struct fat_cluster *out)
+static int fat_alloc_cluster(uint32_t parent, struct fat_fs *fs, uint32_t *out)
 {
         uint32_t new_cl;
 
@@ -871,133 +976,238 @@ static int fat_alloc_get_cluster(uint32_t parent, struct fat_fs *fs,
                 fat_modify_fat(parent, new_cl, fs);
         }
 
-        return fat_read_cluster(out, fs);
+        if (out)
+                *out = new_cl;
+        return 0;
 }
 
 /*
  * allocate space for and commit a new dentry given a parent dentry.
  *
  * @dentry   The dentry to write.
- * @parent   The parent dentry, or NULL if we're writing the root.
+ * @parent   The 
  * @fs       The fat filesystem instance to operate on.
  *
- * @returns 0 on success, negative values on error, 1 if the parent
- * dentry needs to be committed to disk.
+ * @returns 0 on success, negative values on error, 1 if the parent dentry needs
+ * to be committed to disk.
  *
- * xxx: this function is horrible and I'm not proud of it
+ * This function walks through the directory described by 'parent' and looks for
+ * a suitable spot to place the new dentry. There are several cases here:
+ *     (1) The annoying base case in which the parent directory is empty (i.e.
+ *         we're writing the first dentry)
+ *     (2) We can find a deleted dentry.
+ *     (3) We have to append to the end of the directory (no deleted dentries)
+ *
+ * This one is a little long and a little nasty, but I've tried to make it
+ * as clear as possible.
+ *
+ * xxx: track d_size in parent dentry
+ * xxx: link count in parent dentry
  */ 
 static int fat_write_new_dentry(struct fat_dentry *dentry,
-                                struct fat_dentry *parent,
-                                struct fat_fs *fs)
+                                const struct fat_diter *parent)
 {
-        int ret;
-        struct fat_cluster cluster, new_cluster;
+        struct fat_diter diter, next;
+        int err;
+        struct fat_dentry *d;
 
-        cluster.c_idx = parent ? parent->d_idx : 0;
-        cluster.c_is_file = false;
-        new_cluster.c_is_file = false;
+        diter.di_fs = parent->di_fs;
 
-        /* dentry points to nothing, i.e. dir is empty */
-        if (cluster.c_idx == FAT_END_MARK) {
-                ret = fat_alloc_get_cluster(cluster.c_idx, fs, &cluster);
-                if (ret)
-                        return ret;
+        d = fat_diter_get(parent);
+        err = fat_diter_begin(&diter, d);
+        if (err) {
+                if (err != -ENOENT)
+                        return err;
 
-                parent->d_idx = cluster.c_idx;
-                fat_dentry_set_flag(FAT_DF_LAST, dentry);
-                cluster.c_dentries[0] = *dentry;
-                ret = fat_write_cluster(&cluster, fs);
-                if (ret)
-                        return ret;
-
-                /* we changed parents d->d_idx, so it needs to be written */
-                return 1;
+                /* case (1): parent directory is empty */
+                err = fat_alloc_cluster(FAT_END_MARK, diter.di_fs, &d->d_idx);
+                if (err)
+                        return err;
+                err = fat_diter_begin(&diter, d);
+                if (err)
+                        return err;
+                d = fat_diter_get(&diter);
+                *d = *dentry;
+                fat_dentry_set_flag(FAT_DF_LAST, d);
+                err = fat_diter_commit(&diter);
+                if (err)
+                        goto out_free_diter;
+                /*
+                 * now that we've for sure written out a 'last' dentry in the
+                 * new cluster, we can commit the parent with the new cluster
+                 * index
+                 */
+                err = fat_diter_commit(parent);
+                goto out_free_diter;
         }
         
         for (;;) {
-                unsigned c_idx;
-                ret = fat_read_cluster(&cluster, fs);
-                if (ret)
-                        return ret;
+                d = fat_diter_get(&diter);
 
-                for (c_idx = 0; c_idx < DENTRIES_PER_CLUSTER; ++c_idx) {
-                        struct fat_dentry *d = &cluster.c_dentries[c_idx];
+                if (fat_dentry_is_del(d)) {
+                        /* case (2): we found a deleted dentry */
+                        *d = *dentry;
+                        err = fat_diter_commit(&diter);
+                        goto out_free_diter;
+                } else if (fat_dentry_is_last(d)) {
+                        /*
+                         * case (3): last dentry aka nastyness
+                         *
+                         * So we found the last dentry in a directory, but
+                         * the current cluster of dentries is full so we
+                         * have to:
+                         *   (1) allocate a cluster
+                         *   (2) mark the new dentry as 'last' and commit it
+                         *   (3) mark the old last dentry as 'not last' and
+                         *       commit that.
+                         *
+                         * We need to do (3) after (2) so that if (2) fails,
+                         * we don't end up with a directory with no 'last'
+                         * dentry, which would be break everything. In this
+                         * case if (2) succeeds but (3) fails, we end up with
+                         * a leaked cluster instead, which is annoying
+                         * but not catastophic. (however, we don't currently
+                         * do anything to try and remedy the leaked cluster
+                         * since it's so unlikely ...)
+                         */ 
+                        if (diter.di_d_index == DENTRIES_PER_CLUSTER - 1) {
+                                struct fat_dentry *slot;
 
-                        if (fat_dentry_is_del(d)) {
-                                *d = *dentry;
-                                return fat_write_cluster(&cluster, fs);
-                        } else if (!fat_dentry_is_last(d))
-                                continue;
+                                /* 1: allocate a cluster */
+                                err = fat_diter_alloc_cluster(&diter);
+                                if (err)
+                                        goto out_free_diter;
 
-                        /* we got to the last dentry in the directory */
+                                err = fat_diter_clone(&diter, &next);
+                                if (err)
+                                        goto out_free_diter;
+                                err = fat_diter_advance(&next);
+                                if (err)
+                                        goto out_free_next;
+                                slot = fat_diter_get(&next);
+                                *slot = *dentry;
 
-                        fat_dentry_set_flag(FAT_DF_LAST, dentry);
-                        
-                        /* do we need to allocate a new cluster for this
-                         * directory? */
-                        if (c_idx == DENTRIES_PER_CLUSTER - 1) {
-                                ret = fat_alloc_get_cluster(cluster.c_idx, fs,
-                                                            &new_cluster);
-                                if (ret)
-                                        return ret;
+                                /* 2: mark the new dentry as last */
+                                fat_dentry_set_flag(FAT_DF_LAST, slot);
+                                err = fat_diter_commit(&next);
+                                if (err)
+                                        /* XXX: leaking a cluster here */
+                                        goto out_free_next;
 
-                                new_cluster.c_dentries[0] = *dentry;
-                                ret = fat_write_cluster(&new_cluster, fs);
-                                if (ret)
-                                        /* XXX: leaking a cluster here? */
-                                        return ret;
+                                /* 3: mark the old last dentry as 'not last' */
+                                fat_dentry_clear_flag(FAT_DF_LAST, d);
+                                err = fat_diter_commit(&diter);
+                                goto out_free_next;
                         } else {
-                                cluster.c_dentries[c_idx+1] = *dentry;
+                                fat_dentry_clear_flag(FAT_DF_LAST, d);
+                                err = fat_diter_advance(&diter);
+                                /* should never error here */
+                                assert(err == 0);
+                                d = fat_diter_get(&diter);
+                                *d = *dentry;
+                                fat_dentry_set_flag(FAT_DF_LAST, d);
+                                err = fat_diter_commit(&diter);
+                                goto out_free_diter;
                         }
-
-                        fat_dentry_clear_flag(FAT_DF_LAST, d);
-                        return fat_write_cluster(&cluster, fs);
+                } else {
+                        err = fat_diter_advance(&diter);
+                        if (err)
+                                goto out_free_diter;
                 }
-                cluster.c_idx = fat_follow_chain(cluster.c_idx, fs);
         }
 
-        /* unreachable */
-        assert(false);
-        return -EINVAL;
-}                            
+out_free_next:
+        fat_diter_end(&next);
+out_free_diter:
+        fat_diter_end(&diter);
+        return err;
+}
 
 static int fat_getattr(const char *path, struct stat *stbuf)
 {
         int err;
-        struct fat_dentry dentry;
+        struct fat_dentry d;
 
         fat_trace("%s: path=%s", __func__, path);
-
-        err = fat_get_dentry(path, &global_fat_fs, &dentry);
+        err = fat_get_dentry(path, &global_fat_fs, &d);
         if (err)
                 return err;
 
         memset(stbuf, 0, sizeof *stbuf);
-        stbuf->st_mode = dentry.d_flags & FAT_DF_STAT_MASK;
-        if (fat_dentry_is_file(&dentry)) {
+        stbuf->st_mode = d.d_flags & FAT_DF_STAT_MASK;
+        stbuf->st_size = d.d_fsize;
+        if (fat_dentry_is_file(&d)) {
                 stbuf->st_nlink = 1;
-                stbuf->st_size = dentry.d_fsize;
+                stbuf->st_mode |= S_IFREG;
         } else {
                 stbuf->st_nlink = 2;
-                /* XXX: should be size of all child dentries? */
                 stbuf->st_size = FAT_BLOCK_SIZE;
+                stbuf->st_mode |= S_IFDIR;
         }
 
         stbuf->st_blksize = FAT_CLUSTER_SIZE;
         stbuf->st_blocks = (stbuf->st_size + FAT_BLOCK_SIZE - 1)/FAT_BLOCK_SIZE;
-
         return 0;
 }
 
 static int fat_access(const char *path, int mask)
 {
-        return -ENOSYS;
+        int err;
+        struct fat_dentry d;
+        struct fuse_context *ctx;
+
+        fat_trace("%s: path=%s, mask=0x%x", __func__, path, mask);
+        err = fat_get_dentry(path, &global_fat_fs, &d);
+        if (err)
+                return err;
+
+        ctx = fuse_get_context();
+        fat_trace("%s: d.d_flags=0x%x, d.d_uid=%u, d.d_gid=%u, "
+                  "ctx->uid=%u, ctx->gid=%u", __func__, d.d_flags,
+                  d.d_uid, d.d_gid, ctx->uid, ctx->gid);
+        if ((d.d_flags & mask) == mask
+            || (ctx->gid == d.d_gid && ((d.d_flags >> 3) & mask) == mask)
+            || (ctx->uid == d.d_uid && ((d.d_flags >> 6) & mask) == mask))
+                err = 0;
+        else
+                err = -EACCES;
+
+        return err;
 }
 
 static int fat_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
                        off_t offset, struct fuse_file_info *fi)
 {
-        return -ENOSYS;
+        int err;
+        struct fat_diter diter;
+        struct fat_dentry parent, *d;
+
+        fat_trace("%s: path=%s", __func__, path);
+
+        err = fat_get_dentry(path, &global_fat_fs, &parent);
+        if (err)
+                return err;
+
+        err = fat_diter_begin(&diter, &parent);
+        if (err)
+                return err;
+
+        filler(buf, ".", NULL, 0);
+        filler(buf, "..", NULL, 0);
+        
+        for (;;) {
+                d = fat_diter_get(&diter);
+                if (!fat_dentry_is_del(d))
+                        filler(buf, d->d_name, NULL, 0);
+                if (fat_dentry_is_last(d))
+                        break;
+                err = fat_diter_advance(&diter);
+                if (err)
+                        break;
+        }
+
+        fat_diter_end(&diter);
+        return err;
 }
 
 static int fat_truncate(const char *path, off_t size)
@@ -1034,7 +1244,37 @@ static int fat_mknod(const char *path, mode_t mode, dev_t rdev)
 
 static int fat_mkdir(const char *path, mode_t mode)
 {
-        return -ENOSYS;
+        size_t len;
+        int err;
+        struct fat_diter diter;
+        struct fat_dentry d;
+        const char *c;
+        struct fuse_context *ctx;
+
+        len = strlen(path);
+        c = path+(len-1);
+        while (*--c != '/')
+                if (--len == 0)
+                        return -EINVAL;
+        c++;
+        strcpy(d.d_name, c);
+        len = strlen(c);
+        if (*(c+(len-1)) == '/')
+                d.d_name[len-1] = '\0';
+        fat_dentry_set_flag(FAT_DF_DENTRY|FAT_DF_XOTH|FAT_DF_ROTH|
+                            FAT_DF_XGRP|FAT_DF_RGRP|FAT_DF_XUSR|FAT_DF_WUSR|
+                            FAT_DF_RUSR, &d);
+        ctx = fuse_get_context();
+        d.d_idx = FAT_END_MARK;
+        d.d_fsize = 0;
+        d.d_uid = ctx->uid;
+        d.d_gid = ctx->gid;
+        err = fat_get_diter(path, &global_fat_fs, &diter);
+        if (err)
+                return err;
+        err = fat_write_new_dentry(&d, &diter);
+        fat_diter_end(&diter);
+        return err;
 }
 
 static int fat_unlink(const char *path)
