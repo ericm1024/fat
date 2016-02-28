@@ -16,7 +16,7 @@ unmount:
 
 # debug mount 
 dmount: $(TARGET) $(MNT_DIR) unmount
-	./$(TARGET) -s -f -d $(MNT_DIR)
+	./$(TARGET) -s -f $(MNT_DIR)
 
 mount: $(TARGET) $(MNT_DIR) unmount
 	./$(TARGET) -s $(MNT_DIR)
