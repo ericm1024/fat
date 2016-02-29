@@ -3,20 +3,9 @@
  *
  * author: Eric Mueller <emueller@hmc.edu>
  *
- * addapted from first assignment, hellofs
- */
-
-/*
- * TODO:
- *     - implement init
- *         - implement mkfs
- *         - implement mount
- *     - implement getattr
- *         - implement dentry lookup
- *     - implement access
- *     - implement readdir
- *     - implement mkdir
- *         - implement cluster allocation
+ * Currently this implements access(), getattr(), mkdir(), and readdir()
+ *
+ * Directory size is only limited by filesystem size.
  */
 
 #define FUSE_USE_VERSION 26
@@ -69,25 +58,14 @@ struct packed fat_superblock {
         uint8_t __pad[FAT_BLOCK_SIZE - 16];
 };
 
-/* maximum filename length. Chosen so dentry size divides block size */
-#define FAT_NAME_LEN (18)
-
 /* dentry flags */
-#define FAT_DF_XOTH    (0x1u << 0)
-#define FAT_DF_WOTH    (0x1u << 1)
-#define FAT_DF_ROTH    (0x1u << 2)
-#define FAT_DF_XGRP    (0x1u << 3)
-#define FAT_DF_WGRP    (0x1u << 4)
-#define FAT_DF_RGRP    (0x1u << 5)
-#define FAT_DF_XUSR    (0x1u << 6)
-#define FAT_DF_WUSR    (0x1u << 7)
-#define FAT_DF_RUSR    (0x1u << 8)
-#define FAT_DF_FILE    (0x1u << 9)  /* dentry is a file */
-#define FAT_DF_DENTRY  (0x1u << 10) /* dentry is another dentry */
-#define FAT_DF_DEL     (0x1u << 11) /* dentry has been deleted */
-#define FAT_DF_LAST    (0x1u << 12) /* last dentry in dirrectory */
+#define FAT_DF_FILE    (0x1u << 0) /* dentry is a file */
+#define FAT_DF_DENTRY  (0x1u << 1) /* dentry is another dentry */
+#define FAT_DF_DEL     (0x1u << 2) /* dentry has been deleted */
+#define FAT_DF_LAST    (0x1u << 3) /* last dentry in dirrectory */
 
-#define FAT_DF_STAT_MASK ((1 << 9) - 1) /* mask for stat->st_mode */
+/* maximum filename length. Chosen so dentry size divides block size */
+#define FAT_NAME_LEN (22)
 
 /*
  * on-disk fat directory entry
@@ -96,16 +74,12 @@ struct packed fat_superblock {
  * @d_flags   dentry flags, a la FAT_DF_*
  * @d_idx     cluster index of the object described by this dentry
  * @d_fsize   if this dentry describes a file, the field holds its size
- * @d_uid     user id of object
- * @d_gid     group id of object
  */ 
 struct packed fat_dentry {
         char d_name[FAT_NAME_LEN];
         uint16_t d_flags;
         uint32_t d_idx;
         uint32_t d_fsize;
-        uint16_t d_uid;
-        uint16_t d_gid;
 };
 
 #define DENTRIES_PER_CLUSTER (FAT_CLUSTER_SIZE/sizeof(struct fat_dentry))
@@ -157,8 +131,15 @@ struct fat_fs {
         int f_fd;
 };
 
+static struct fat_fs global_fat_fs;
+
 /*
- * dentry iterator
+ * dentry iterator used to walk through a dentry
+ *
+ * @di_fs        The filesystem instance we're operating on.
+ * @di_cluster   Cluster buffer. Dynamically allocated.
+ * @di_d_index   Which dentry in the current cluster does this iterator
+ *               represent?
  */ 
 struct fat_diter {
         struct fat_fs *di_fs;
@@ -168,8 +149,6 @@ struct fat_diter {
 
 static int fat_alloc_cluster(uint32_t parent, struct fat_fs *fs, uint32_t *out);
 
-static struct fat_fs global_fat_fs;
-
 /*
  * this makes the compiler type-check format strings for functions that
  * behave like printf, because frankly I always mess them up.
@@ -178,10 +157,7 @@ static struct fat_fs global_fat_fs;
 #define __printf_like(fmt, args) \
         __attribute__((format(printf, fmt, args)))
 
-/*
- * common error reporting function in case we ever want to write to a log
- * file or something fancy
- */ 
+/* common error reporting function */
 static void __printf_like(1, 2) fat_error(const char *fmt, ...)
 {
         va_list args;
@@ -189,12 +165,10 @@ static void __printf_like(1, 2) fat_error(const char *fmt, ...)
         vfprintf(stderr, fmt, args);
         va_end(args);
         fprintf(stderr, "\n");
+        /*exit(1)*/
 }
 
-/*
- * common tracing function so we can enable/disable tracing based on
- * compliation/runtime arguments
- */ 
+/* common tracing function */
 static void __printf_like(1, 2) fat_trace(const char *fmt, ...)
 {
         va_list args;
@@ -606,7 +580,8 @@ static int fat_diter_commit(const struct fat_diter *diter)
  * @path     path to lookup dentry for. should start with a '/'
  * @parent   parent dentry if already looked up, can be NULL
  * @fs       fat instance
- * @out_d    the resulting dentry is written here
+ * @out_d    the resulting dentry is written here. Note that this MUST
+ *           BE FREE'D using fat_diter_end
  *
  * @returns 0 on success, negative values on error.
  * 
@@ -621,6 +596,9 @@ static int __fat_get_diter(const char *path, const struct fat_dentry *parent,
         fat_trace("%s: path='%s', parent=%p", __func__, path, (void*)parent);
         if (!*path || *path != '/')
                 return -EINVAL;
+
+        if (parent && !fat_dentry_is_dentry(parent))
+                return -ENOTDIR;
 
         diter.di_fs = fs;
         err = fat_diter_begin(&diter, parent);
@@ -641,14 +619,16 @@ static int __fat_get_diter(const char *path, const struct fat_dentry *parent,
                                 return 0;
                         }
                         err = __fat_get_diter(path, d, fs, out_d);
-                        fat_diter_end(&diter);
-                        return err;
+                        goto out_free_diter;
                 }
                 
                 err = fat_diter_advance(&diter);
                 if (err)
-                        return err;
+                        goto out_free_diter;
         }
+out_free_diter:
+        fat_diter_end(&diter);
+        return err;
 }
 
 /* see __fat_get_diter */
@@ -658,6 +638,12 @@ static int fat_get_diter(const char *path, struct fat_fs *fs,
         return __fat_get_diter(path, NULL, fs, out);
 }
 
+/*
+ * Lookup a dentry without getting the whole directory iterator.
+ * Good for doing read-only things with dentries, but not useful
+ * for read/write as a dentry doesn't itself have enough information
+ * to know where to be written to disk.
+ */ 
 static int fat_get_dentry(const char *path, struct fat_fs *fs,
                           struct fat_dentry *out)
 {
@@ -743,14 +729,9 @@ static int fat_mkfs(int fd, size_t size)
         memset(&cluster, 0, sizeof cluster);
         root_dentry = &cluster.c_dentries[0];
         root_dentry->d_name[0] = '\0';
-        fat_dentry_set_flag(FAT_DF_LAST|FAT_DF_DENTRY|FAT_DF_XOTH|
-                            FAT_DF_ROTH|FAT_DF_XGRP|FAT_DF_RGRP|FAT_DF_XUSR|
-                            FAT_DF_WUSR|FAT_DF_RUSR, root_dentry);
+        fat_dentry_set_flag(FAT_DF_LAST|FAT_DF_DENTRY, root_dentry);
         root_dentry->d_idx = FAT_END_MARK;
         root_dentry->d_fsize = 0;
-        /* xxx: is this the uid and gid we want? */
-        root_dentry->d_uid = getuid();
-        root_dentry->d_gid = getgid();
 
         err = __fat_write_blocks(nr_fat_entries*sizeof(uint32_t)
                                  + FAT_BLOCK_SIZE, fd,
@@ -782,8 +763,7 @@ static int fat_verify_sb(struct fat_superblock *sb)
 }
 
 /*
- * initialize a fat_fs structure by reading reading and parsing a backing
- * file.
+ * initialize a fat_fs structure by reading and parsing a backing file.
  *
  * @bfile_name   The name of the backing file that contains the filesystem.
  *               A file with this name is created and initialized if one
@@ -1195,18 +1175,15 @@ static int fat_getattr(const char *path, struct stat *stbuf)
 {
         int err;
         struct fat_dentry d;
-        struct fuse_context *ctx;
 
         fat_trace("%s: path=%s", __func__, path);
         err = fat_get_dentry(path, &global_fat_fs, &d);
         if (err)
                 return err;
 
-        ctx = fuse_get_context();
         memset(stbuf, 0, sizeof *stbuf);
-        stbuf->st_mode = d.d_flags & FAT_DF_STAT_MASK;
-        stbuf->st_uid = d.d_uid;
-        stbuf->st_gid = d.d_gid;
+        /* fake perms */
+        stbuf->st_mode = S_IRWXU|S_IRGRP|S_IXGRP|S_IROTH|S_IXOTH;
         stbuf->st_size = d.d_fsize;
         if (fat_dentry_is_file(&d)) {
                 stbuf->st_nlink = 1;
@@ -1224,27 +1201,8 @@ static int fat_getattr(const char *path, struct stat *stbuf)
 
 static int fat_access(const char *path, int mask)
 {
-        int err;
-        struct fat_dentry d;
-        struct fuse_context *ctx;
-
-        fat_trace("%s: path=%s, mask=0x%x", __func__, path, mask);
-        err = fat_get_dentry(path, &global_fat_fs, &d);
-        if (err)
-                return err;
-
-        ctx = fuse_get_context();
-        fat_trace("%s: d.d_flags=0x%x, d.d_uid=%u, d.d_gid=%u, "
-                  "ctx->uid=%u, ctx->gid=%u", __func__, d.d_flags,
-                  d.d_uid, d.d_gid, ctx->uid, ctx->gid);
-        if ((d.d_flags & mask) == mask
-            || (ctx->gid == d.d_gid && ((d.d_flags >> 3) & mask) == mask)
-            || (ctx->uid == d.d_uid && ((d.d_flags >> 6) & mask) == mask))
-                err = 0;
-        else
-                err = -EACCES;
-
-        return err;
+        /* we don't implement perms */
+        return 0;
 }
 
 static int fat_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
@@ -1262,12 +1220,12 @@ static int fat_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 
         filler(buf, ".", NULL, 0);
         filler(buf, "..", NULL, 0);
-        
+
         diter.di_fs = &global_fat_fs;
         err = fat_diter_begin(&diter, &parent);
         if (err)
                 return err == -ENOENT ? 0 : err;
-        
+
         for (;;) {
                 d = fat_diter_get(&diter);
                 if (!fat_dentry_is_del(d))
@@ -1355,10 +1313,9 @@ static int fat_mkdir(const char *path, mode_t mode)
         struct fat_dentry d;
         char *ppath;
         const char *leaf;
-        struct fuse_context *ctx;
 
         fat_trace("%s: path=%s, mode=0x%x", __func__, path, mode);
-
+        
         /* find the parent path and the name of the leaf */
         ppath = fat_get_ppath(path);
         if (!ppath)
@@ -1375,14 +1332,9 @@ static int fat_mkdir(const char *path, mode_t mode)
         memset(&d, 0, sizeof d);
         strcpy(d.d_name, leaf);
         assert(d.d_name[sizeof d.d_name - 1] == '\0');
-        fat_dentry_set_flag(FAT_DF_DENTRY|FAT_DF_XOTH|FAT_DF_ROTH|
-                            FAT_DF_XGRP|FAT_DF_RGRP|FAT_DF_XUSR|FAT_DF_WUSR|
-                            FAT_DF_RUSR, &d);
-        ctx = fuse_get_context();
+        fat_dentry_set_flag(FAT_DF_DENTRY, &d);
         d.d_idx = FAT_END_MARK;
         d.d_fsize = 0;
-        d.d_uid = ctx->uid;
-        d.d_gid = ctx->gid;
 
         /* commit the dentry */
         err = fat_get_diter(ppath, &global_fat_fs, &diter);
@@ -1442,11 +1394,7 @@ static int fat_statfs(const char *path, struct statvfs *stbuf)
 
 static int fat_release(const char *path, struct fuse_file_info *fi)
 {
-        (void)path;
-        (void)fi;
-
-        /* we don't keep and state about open files, so release does nothing */
-        return 0;
+        return -ENOSYS;
 }
 
 static struct fuse_operations fat_oper = {
