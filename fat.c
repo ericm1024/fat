@@ -485,8 +485,6 @@ static int fat_write_cluster(const struct fat_cluster *cluster,
                 + sizeof(uint32_t)*fs->f_sb->s_fat_entries
                 + FAT_CLUSTER_SIZE*cluster->c_idx;
 
-        fat_trace("%s: offset is 0x%lx", __func__, offset);
-
         if (!fat_cluster_is_allocated(fs, cluster->c_idx))
                 return -ENOENT;
         return fat_write_blocks(offset, fs, FAT_CLUSTER_SIZE, &cluster->c_fbuf);
@@ -519,6 +517,21 @@ static int fat_diter_begin(struct fat_diter *di,
 static struct fat_dentry *fat_diter_get(const struct fat_diter *di)
 {
         return &di->di_cluster->c_dentries[di->di_d_index];
+}
+
+static int fat_diter_advance_cluster(struct fat_diter *di)
+{
+        int ret;
+        uint32_t idx = fat_follow_chain(di->di_cluster->c_idx,
+                                        di->di_fs);
+        if (idx == FAT_END_MARK)
+                return -ENOENT;
+        di->di_cluster->c_idx = idx;
+        ret = fat_read_cluster(di->di_cluster, di->di_fs);
+        if (ret)
+                return ret;
+        di->di_d_index = 0;
+        return ret;
 }
 
 static int fat_diter_advance_force(struct fat_diter *di)
@@ -571,19 +584,8 @@ static int fat_diter_alloc_cluster(struct fat_diter *diter)
         return fat_alloc_cluster(diter->di_cluster->c_idx, diter->di_fs, NULL);
 }
 
-static loff_t fat_diter_offset(const struct fat_diter *diter)
-{
-        return FAT_BLOCK_SIZE + /* superblock */
-                diter->di_fs->f_sb->s_fat_entries * 4 + /* fat */
-                diter->di_cluster->c_idx * FAT_CLUSTER_SIZE + /* clus off */
-                diter->di_d_index * sizeof(struct fat_dentry); /* dir off */
-}
-
 static int fat_diter_commit(const struct fat_diter *diter)
 {
-        struct fat_dentry *d = fat_diter_get(diter);
-        fat_trace("%s: d_name=%s, offset=0x%lx", __func__, d->d_name,
-                  fat_diter_offset(diter));
         return fat_write_cluster(diter->di_cluster, diter->di_fs);
 }
 
@@ -606,12 +608,13 @@ static int __fat_get_diter(const char *path, const struct fat_dentry *parent,
         struct fat_diter diter;
         int err;
 
-        fat_trace("%s: path='%s', parent=%p", __func__, path, (void*)parent);
         if (!*path || *path != '/')
                 return -EINVAL;
 
-        if (parent && !fat_dentry_is_dir(parent))
+        if (parent && !fat_dentry_is_dir(parent)) {
+                printf("%s bombed\n", __func__);
                 return -ENOTDIR;
+        }
 
         diter.di_fs = fs;
         err = fat_diter_begin(&diter, parent);
@@ -625,16 +628,12 @@ static int __fat_get_diter(const char *path, const struct fat_dentry *parent,
                     && fat_path_matches_dentry(path, d)) {
                         if (!fat_path_eat_level(&path, d)) {
                                 *out_d = diter;
-                                fat_trace("%s: found dentry in cluster=%u, "
-                                          "dname=%s, index=%u", __func__,
-                                          diter.di_cluster->c_idx,
-                                          d->d_name, diter.di_d_index);
                                 return 0;
                         }
                         err = __fat_get_diter(path, d, fs, out_d);
                         goto out_free_diter;
                 }
-                
+               
                 err = fat_diter_advance(&diter);
                 if (err)
                         goto out_free_diter;
@@ -950,17 +949,11 @@ static void fat_modify_fat(uint32_t idx, uint32_t new, struct fat_fs *fs)
         int ret;
         ptrdiff_t fat_off = FAT_BLOCK_SIZE*((idx*sizeof idx)/FAT_BLOCK_SIZE);
         off_t file_off = fat_off + FAT_BLOCK_SIZE; /* account for sb */
-        uint32_t old = fs->f_fat[idx];
         assert(idx < fs->f_sb->s_fat_entries);
 
-        fat_trace("%s: committing fat change at idx=%u: old=0x%x, new=0x%x, "
+        fat_trace("%s: committing fat change at idx=%u: old=%u, new=%u, "
                   "file_off=%lu", __func__, idx, fs->f_fat[idx],
                   new, file_off);
-
-        if (old != FAT_FREE_MARK && old != FAT_END_MARK
-            && new != FAT_FREE_MARK && new != FAT_END_MARK)
-                fat_error("%s: possible cluster clobbering: idx=%u, old=%u, "
-                          "new=%u", __func__, idx, old, new);
 
         fs->f_fat[idx] = new;
         ret = fat_write_blocks(file_off, fs, FAT_BLOCK_SIZE,
@@ -1030,6 +1023,7 @@ static int fat_free_cluster(uint32_t idx, struct fat_fs *fs)
 {
         int err;
 
+        fat_modify_fat(idx, FAT_FREE_MARK, fs);
         err = fat_flist_push(fs, idx);
         if (err)
                 return err;
@@ -1040,7 +1034,6 @@ static int fat_free_cluster(uint32_t idx, struct fat_fs *fs)
                 fs->f_sb->s_free--;
                 return err;
         }
-        fat_modify_fat(idx, FAT_FREE_MARK, fs);
         return err;
 }
 
@@ -1256,10 +1249,10 @@ static size_t fat_count_dentries(struct fat_cluster *cl)
         size_t count, i;
         for (count = 0, i = 0; i < FAT_DENTRIES_PER_CLUSTER; ++i) {
                 struct fat_dentry *d = &cl->c_dentries[i];
+                if (!fat_dentry_is_del(d))
+                        count++;
                 if (fat_dentry_is_last(d))
                         break;
-                else if (!fat_dentry_is_del(d))
-                        count++;
         }
         return count;
 }
@@ -1270,25 +1263,59 @@ static int fat_merge_dir_clusters(struct fat_diter *target,
 {
         struct fat_cluster *tcl = target->di_cluster;
         struct fat_cluster *vcl = victim->di_cluster;
-        size_t i, j;
         uint32_t vidx = vcl->c_idx;
         struct fat_fs *fs = target->di_fs;
+        int err;
+        struct fat_cluster new;
+        new.c_idx = tcl->c_idx;
+        size_t new_idx = 0, i;
 
-        /* move all valid dentries from victim to target */
-        for (i = 0, j = 0; i < FAT_DENTRIES_PER_CLUSTER; ++i) {
-                struct fat_dentry *slot = &tcl->c_dentries[i];
-                if (!fat_dentry_is_del(slot))
-                        continue;
-                while (j < FAT_DENTRIES_PER_CLUSTER
-                       && fat_dentry_is_del(&vcl->c_dentries[j]))
-                        j++;
-                if (j >= FAT_DENTRIES_PER_CLUSTER)
+        fat_trace("%s: tcl->c_idx=%u, vcl->c_idx=%u, target has %zu dentries, victim has %zu dentries",
+                  __func__, tcl->c_idx, vcl->c_idx,
+                  fat_count_dentries(tcl), fat_count_dentries(vcl));
+
+        memset(&new, 0, sizeof new);
+        new.c_idx = tcl->c_idx;
+        for (i = 0; i < FAT_DENTRIES_PER_CLUSTER; ++i) {
+                struct fat_dentry *d = &tcl->c_dentries[i];
+                bool was_last = fat_dentry_is_last(d);
+                if (!fat_dentry_is_del(d)) {
+                        fat_trace("%s: tcl[%zu]=\"%s\"", __func__, i, d->d_name);
+                        fat_dentry_clear_flag(FAT_DF_LAST, d);
+                        new.c_dentries[new_idx++] = *d;
+                }
+                if (was_last)
                         break;
-                *slot = vcl->c_dentries[j++];
+        }
+        for (i = 0; i < FAT_DENTRIES_PER_CLUSTER; ++i) {
+                struct fat_dentry *d = &vcl->c_dentries[i];
+                bool was_last = fat_dentry_is_last(d);
+                if (!fat_dentry_is_del(d)) {
+                        fat_trace("%s: vcl[%zu]=\"%s\"", __func__, i, d->d_name);
+                        fat_dentry_clear_flag(FAT_DF_LAST, d);
+                        new.c_dentries[new_idx++] = *d;
+                }
+                if (was_last)
+                        break;
+        }
+
+        if (fat_follow_chain(vidx, fs) == FAT_END_MARK)
+                fat_dentry_set_flag(FAT_DF_LAST, &new.c_dentries[--new_idx]);
+        memcpy(tcl, &new, sizeof new);
+        err = fat_diter_commit(target);
+        if (err)
+                return err;
+
+        for (i = 0; i < FAT_DENTRIES_PER_CLUSTER; ++i) {
+                struct fat_dentry *d = &tcl->c_dentries[i];
+                if (!fat_dentry_is_del(d))
+                        fat_trace("%s: tcl[%zu]=\"%s\"", __func__, i, d->d_name);
+                if (fat_dentry_is_last(d))
+                        break;
         }
 
         /* remove the victim cluster from the cluster chain */
-        fat_modify_fat(tcl->c_idx, fat_follow_chain(vcl->c_idx, fs), fs);
+        fat_modify_fat(tcl->c_idx, fat_follow_chain(vidx, fs), fs);
         return fat_free_cluster(vidx, fs);
 }
 
@@ -1301,7 +1328,8 @@ static int fat_delete_dentry(struct fat_diter *diter, const char *path)
         int err;
         struct fat_fs *fs = diter->di_fs;
         struct fat_dentry *d = fat_diter_get(diter);
-        struct fat_diter tmp;
+        struct fat_dentry *pd;
+        struct fat_diter next, parent;
         char *ppath = NULL;
         uint32_t idx;
 
@@ -1311,47 +1339,62 @@ static int fat_delete_dentry(struct fat_diter *diter, const char *path)
         if (err)
                 return err;
 
-        /* merge adjacent clusters, if possible */
-        err = fat_diter_clone(diter, &tmp);
-        if (err)
-                return err;
-        err = fat_diter_advance(&tmp);
-        if (err) {
-                if (err != -ENOENT)
-                        goto out_free_tmp;
-                if (fat_count_dentries(tmp.di_cluster)
-                    + fat_count_dentries(diter->di_cluster)
-                    <= FAT_DENTRIES_PER_CLUSTER) {
-                        err = fat_merge_dir_clusters(diter, &tmp);
-                }
-        }
-        fat_diter_end(&tmp);
-
         /* get the parent dentry */
         ppath = fat_get_ppath(path);
         if (!ppath)
                 return -ENOMEM;
-        err = fat_get_diter(ppath, fs, &tmp);
+        err = fat_get_diter(ppath, fs, &parent);
         if (err)
                 goto out_free_ppath;
-        d = fat_diter_get(&tmp);
-        
+        pd = fat_diter_get(&parent);
+
+        /* merge adjacent clusters, if possible */
+        err = fat_diter_clone(diter, &next);
+        if (err)
+                goto out_free_parent;
+        err = fat_diter_advance_cluster(&next);
+        if (err) {
+                if (err != -ENOENT)
+                        goto out_free_next;
+                err = 0;
+        } else {
+                if (fat_count_dentries(next.di_cluster)
+                    + fat_count_dentries(diter->di_cluster)
+                    <= FAT_DENTRIES_PER_CLUSTER) {
+
+                        fat_trace("%s: merging adjacent cluster", __func__);
+                        
+                        err = fat_merge_dir_clusters(diter, &next);
+                        pd->d_fsize -= FAT_CLUSTER_SIZE;
+                        err = fat_diter_commit(&parent);
+                        if (err)
+                                goto out_free_next;
+                }
+        }
+
         /* decriment d_nlink in parent, if necessary */
         if (fat_dentry_is_dir(d)) {
-                d->d_nlink--;
-                err = fat_diter_commit(&tmp);
+
+                fat_trace("%s: decrementing nlink in parent", __func__);
+                
+                pd->d_nlink--;
+                err = fat_diter_commit(&parent);
                 if (err)
-                        goto out_free_tmp;
-                fat_diter_end(&tmp);
+                        goto out_free_next;
         }
 
         /* empty a directory if we're removing the last dentry */
         idx = diter->di_cluster->c_idx;
-        if (d->d_idx == idx && fs->f_fat[idx] == FAT_END_MARK
+        if (pd->d_idx == idx && fs->f_fat[idx] == FAT_END_MARK
             && fat_count_dentries(diter->di_cluster) == 0) {
+
+                fat_trace("%s: removing last dentry in directory", __func__);
+
                 /* modify the parent dentry to point to nothing */
-                d->d_idx = FAT_END_MARK;
-                err = fat_diter_commit(&tmp);
+                pd->d_idx = FAT_END_MARK;
+                assert(pd->d_fsize == FAT_CLUSTER_SIZE);
+                pd->d_fsize = 0;
+                err = fat_diter_commit(&parent);
                 if (err)
                         goto out_free_ppath;
 
@@ -1359,10 +1402,12 @@ static int fat_delete_dentry(struct fat_diter *diter, const char *path)
                 err = fat_free_cluster(idx, fs);
         }
 
+out_free_next:
+        fat_diter_end(&next);
+out_free_parent:
+        fat_diter_end(&parent);
 out_free_ppath:
         free(ppath);
-out_free_tmp:
-        fat_diter_end(&tmp);
         return err;
 }
 
@@ -1371,7 +1416,6 @@ static int fat_getattr(const char *path, struct stat *stbuf)
         int err;
         struct fat_dentry d;
 
-        fat_trace("%s: path=%s", __func__, path);
         err = fat_get_dentry(path, &global_fat_fs, &d);
         if (err)
                 return err;
@@ -1408,8 +1452,6 @@ static int fat_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
         int err;
         struct fat_diter diter;
         struct fat_dentry parent, *d;
-
-        fat_trace("%s: path=%s", __func__, path);
 
         err = fat_get_dentry(path, &global_fat_fs, &parent);
         if (err)
@@ -1457,8 +1499,6 @@ static int fat_truncate(const char *path, off_t size)
                 err = -EISDIR;
                 goto out_free_diter;
         }
-
-        fat_trace("%s: d->d_fsize=%u", __func__, d->d_fsize);
 
         idx = d->d_idx;
 
@@ -1683,13 +1723,7 @@ static int fat_mknod(const char *path, mode_t mode, dev_t rdev)
         const char *leaf;
         int err = -ENOTSUP;
 
-        fat_trace("%s: path=%s, mode=0x%x", __func__, path, mode);
-        
-        if ((mode & S_IFCHR) ||
-            (mode & S_IFBLK) ||
-            (mode & S_IFIFO) ||
-            (mode & S_IFSOCK) ||
-            !(mode & S_IFREG))
+        if ((mode & S_IFMT) != S_IFREG)
                 return err;
 
         /* find the parent path and the name of the leaf */
@@ -1778,10 +1812,10 @@ static int fat_unlink(const char *path)
         d = fat_diter_get(&diter);
         if (!fat_dentry_is_file(d) && !fat_dentry_is_link(d))
                 return -EISDIR;
-
         err = fat_truncate(path, 0);
         if (err)
                 return err;
+        
         err = fat_delete_dentry(&diter, path);
         fat_diter_end(&diter);
         return err;
@@ -1803,6 +1837,10 @@ static int fat_rmdir(const char *path)
         if (!fat_dentry_is_dir(d)) {
                 fat_diter_end(&diter);
                 return -ENOTDIR;
+        }
+        if (d->d_fsize != 0) {
+                fat_diter_end(&diter);
+                return -ENOTEMPTY;
         }
         err = fat_delete_dentry(&diter, path);
         fat_diter_end(&diter);
