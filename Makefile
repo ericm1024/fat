@@ -1,4 +1,4 @@
-CC=gcc
+CC=clang
 SHELL=sh
 CFLAGS=-Wall -Wextra -Wno-unused-parameter -pedantic -std=c11 -g $(PKGFLAGS)
 PKGFLAGS=`pkg-config fuse --cflags --libs`
