@@ -744,6 +744,7 @@ static int fat_mkfs(int fd, size_t size)
         fat_dentry_set_flag(FAT_DF_LAST|FAT_DF_DENTRY, root_dentry);
         root_dentry->d_idx = FAT_END_MARK;
         root_dentry->d_fsize = 0;
+        root_dentry->d_nlink = 2;
 
         err = __fat_write_blocks(nr_fat_entries*sizeof(uint32_t)
                                  + FAT_BLOCK_SIZE, fd,
@@ -894,7 +895,7 @@ static int fat_fill_fs(const char *bfile_name, struct fat_fs *fs)
                 goto out_free_freelist;
         }
         
-        for (i = 0; i < sb->s_fat_entries; ++i) {
+        for (i = sb->s_fat_entries; i-- > 0; ) {
                 if (fs->f_fat[i] == FAT_FREE_MARK) {
                         err = fat_flist_push(fs, i);
                         if (err)
@@ -1023,6 +1024,8 @@ static int fat_free_cluster(uint32_t idx, struct fat_fs *fs)
 {
         int err;
 
+        fat_trace("%s: freeing cluster %u", __func__, idx);
+        
         fat_modify_fat(idx, FAT_FREE_MARK, fs);
         err = fat_flist_push(fs, idx);
         if (err)
@@ -1301,6 +1304,9 @@ static int fat_merge_dir_clusters(struct fat_diter *target,
 
         if (fat_follow_chain(vidx, fs) == FAT_END_MARK)
                 fat_dentry_set_flag(FAT_DF_LAST, &new.c_dentries[--new_idx]);
+        else
+                while (new_idx < FAT_DENTRIES_PER_CLUSTER)
+                        fat_dentry_set_flag(FAT_DF_DEL, &new.c_dentries[new_idx++]);
         memcpy(tcl, &new, sizeof new);
         err = fat_diter_commit(target);
         if (err)
@@ -1401,7 +1407,7 @@ static int fat_delete_dentry(struct fat_diter *diter, const char *path)
                 /* free the corresponding cluster */
                 err = fat_free_cluster(idx, fs);
         }
-
+        
 out_free_next:
         fat_diter_end(&next);
 out_free_parent:
@@ -1429,9 +1435,10 @@ static int fat_getattr(const char *path, struct stat *stbuf)
                 stbuf->st_mode |= S_IFREG;
         else if (fat_dentry_is_dir(&d))
                 stbuf->st_mode |= S_IFDIR;
-        else if (fat_dentry_is_link(&d))
+        else if (fat_dentry_is_link(&d)) {
                 stbuf->st_mode |= S_IFLNK;
-        else
+                stbuf->st_mode |= S_IRWXU|S_IRWXG|S_IRWXO;
+        } else
                 fat_error("%s: unknown file type, flags=0x%xu", __func__,
                           d.d_flags);
 
@@ -1480,24 +1487,18 @@ static int fat_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
         return err;
 }
 
-static int fat_truncate(const char *path, off_t size)
+static int __fat_truncate(struct fat_diter *diter, off_t size)
 {
-        struct fat_diter diter;
         struct fat_dentry *d;
         struct fat_fs *fs = &global_fat_fs;
         int err = 0;
         uint32_t idx;
         size_t allocd_size = 0;
-
-        fat_trace("%s: path=%s, size=%lu", __func__, path, size);
         
-        err = fat_get_diter(path, fs, &diter);
-        if (err)
-                return err;
-        d = fat_diter_get(&diter);
+        d = fat_diter_get(diter);
         if (!fat_dentry_is_file(d)) {
                 err = -EISDIR;
-                goto out_free_diter;
+                goto out_commit;
         }
 
         idx = d->d_idx;
@@ -1505,22 +1506,29 @@ static int fat_truncate(const char *path, off_t size)
         /* make the file smaller */
         if (size < d->d_fsize) {
                 /* find the index of the first cluster we should free */
+                uint32_t prev = 0;
                 for (;;) {
-                        allocd_size += FAT_CLUSTER_SIZE;
-                        if (allocd_size >= d->d_fsize) {
-                                uint32_t old_idx = idx;
-                                idx = fat_follow_chain(idx, fs);
-                                fat_modify_fat(old_idx, FAT_END_MARK, fs);
+                        /* do we need the current cluster? */
+                        if (allocd_size >= (size_t)size) {
+                                if (prev)
+                                        fat_modify_fat(prev, FAT_END_MARK, fs);
                                 break;
                         }
+                        allocd_size += FAT_CLUSTER_SIZE;
+                        prev = idx;
                         idx = fat_follow_chain(idx, fs);
                 }
+                
+                fat_trace("%s: idx of first cluster to free=%u", __func__,
+                          idx);
+                
                 /* free all subsequent clusters */
                 while (idx != FAT_END_MARK) {
                         uint32_t next_idx = fat_follow_chain(idx, fs);
                         err = fat_free_cluster(idx, fs);
+                        fat_trace("%s: err: %s", __func__, strerror(-err));
                         if (err)
-                                goto out_free_diter;
+                                goto out_commit;
                         idx = next_idx;
                 }
         }
@@ -1536,6 +1544,9 @@ static int fat_truncate(const char *path, off_t size)
                                 idx = next;
                         }
 
+                fat_trace("%s: index of last allocated cluster=%u", __func__,
+                          idx);
+
                 /* allocate more space */
                 while (allocd_size < (size_t)size) {
                         if (idx == FAT_END_MARK) {
@@ -1545,15 +1556,30 @@ static int fat_truncate(const char *path, off_t size)
                         } else
                                 err = fat_alloc_cluster(idx, fs, &idx);
                         if (err)
-                                goto out_free_diter;
+                                goto out_commit;
                         allocd_size += FAT_CLUSTER_SIZE;
                 }
         }
-out_free_diter:
+
+out_commit:
         if (size == 0)
                 d->d_idx = FAT_END_MARK;
         d->d_fsize = size;
-        err = fat_diter_commit(&diter);
+        return fat_diter_commit(diter);
+}
+
+static int fat_truncate(const char *path, off_t size)
+{
+        struct fat_diter diter;
+        struct fat_fs *fs = &global_fat_fs;
+        int err;
+
+        fat_trace("%s: path=%s, size=%lu", __func__, path, size);
+
+        err = fat_get_diter(path, fs, &diter);
+        if (err)
+                return err;
+        err = __fat_truncate(&diter, size);
         fat_diter_end(&diter);
         return err;
 }
@@ -1660,7 +1686,7 @@ static int fat_write(const char *path, const char *buf, size_t size,
         }
         cur_off = offset;
 
-        cl.c_idx = d.d_idx;
+        cl.c_idx = idx;
         for (written = 0; written < size; ) {
                 size_t cls_start = cur_off%FAT_CLUSTER_SIZE;
                 size_t bytes_to_copy = FAT_CLUSTER_SIZE - cls_start;
@@ -1672,6 +1698,10 @@ static int fat_write(const char *path, const char *buf, size_t size,
                 err = fat_read_cluster(&cl, fs);
                 if (err)
                         return written ? written : err;
+
+                fat_trace("%s: c_idx=%u, bytes_to_copy=%zu, cls_start=%zu, cur_off=%lu",
+                          __func__, cl.c_idx, bytes_to_copy, cls_start, cur_off);
+
                 memcpy(cl.c_fbuf + cls_start, buf + written, bytes_to_copy);
                 err = fat_write_cluster(&cl, fs);
                 if (err)
@@ -1698,7 +1728,7 @@ static int fat_readlink(const char *path, char *buf, size_t size)
                 return err;
         if (!fat_dentry_is_link(&d))
                 return -EINVAL; /* xxx: better err? */
-        if (d.d_idx != FAT_END_MARK) {
+        if (d.d_idx == FAT_END_MARK) {
                 fat_error("%s: empty symlink", __func__);
                 return -EIO;
         }
@@ -1709,8 +1739,11 @@ static int fat_readlink(const char *path, char *buf, size_t size)
                 return err;
         if (size > d.d_fsize)
                 size = d.d_fsize;
-        memcpy(buf, cl.c_fbuf, size);
-        return size;
+        else
+                size--; /* make sure we have room for a null byte */
+        strncpy(buf, (char*)cl.c_fbuf, size);
+        buf[size] = '\0';
+        return 0;
 }
 
 /* more henous code duplication between this and mkdir */
@@ -1809,14 +1842,25 @@ static int fat_unlink(const char *path)
         err = fat_get_diter(path, fs, &diter);
         if (err)
                 return err;
+
+        /* clean up any clusters allocated to the dentry */
         d = fat_diter_get(&diter);
-        if (!fat_dentry_is_file(d) && !fat_dentry_is_link(d))
-                return -EISDIR;
-        err = fat_truncate(path, 0);
+        if (fat_dentry_is_file(d))
+                err = __fat_truncate(&diter, 0);
+        else if (fat_dentry_is_link(d))
+                err = fat_free_cluster(d->d_idx, fs);
+        else
+                err = -EISDIR;
+
         if (err)
-                return err;
-        
+                goto out;
+
+        /* remove the dentry */
         err = fat_delete_dentry(&diter, path);
+        if (err)
+                goto out;
+
+out:
         fat_diter_end(&diter);
         return err;
 }
@@ -1904,7 +1948,7 @@ static int fat_symlink(const char *to, const char *from)
         fat_diter_end(&diter);
 out:
         free(ppath);
-        return -ENOSYS;
+        return 0;
 }
 
 static int fat_rename(const char *from, const char *to)
