@@ -158,17 +158,6 @@ static int fat_alloc_cluster(uint32_t parent, struct fat_fs *fs, uint32_t *out);
 #define __printf_like(fmt, args) \
         __attribute__((format(printf, fmt, args)))
 
-/* common error reporting function */
-static void __printf_like(1, 2) fat_error(const char *fmt, ...)
-{
-        va_list args;
-        va_start(args, fmt);
-        vfprintf(stderr, fmt, args);
-        va_end(args);
-        fprintf(stderr, "\n");
-        /*exit(1)*/
-}
-
 /* common tracing function */
 static void __printf_like(1, 2) fat_trace(const char *fmt, ...)
 {
@@ -377,11 +366,11 @@ static void __fat_write_blocks(off_t offset, int fd, size_t size,
         assert(offset%FAT_BLOCK_SIZE == 0);
 
         if (ret < 0) {
-                fat_error("%s: pwrite failed with %s", __func__,
+                fat_trace("%s: pwrite failed with %s", __func__,
                           strerror(errno));
                 exit(1);
         } else if ((size_t)ret < size) {
-                fat_error("%s: short pwrite at offset=%ld size=%ld",
+                fat_trace("%s: short pwrite at offset=%ld size=%ld",
                           __func__, offset, ret);
                 exit(1);
         }
@@ -424,11 +413,11 @@ static void fat_read_blocks(off_t offset, const struct fat_fs *fs,
         assert(offset%FAT_BLOCK_SIZE == 0);
 
         if (ret < 0) {
-                fat_error("%s: pread failed with %s", __func__,
+                fat_trace("%s: pread failed with %s", __func__,
                           strerror(errno));
                 exit(1);
         } else if ((size_t)ret < size) {
-                fat_error("%s: short pread at offset=%ld size=%ld",
+                fat_trace("%s: short pread at offset=%ld size=%ld",
                           __func__, offset, ret);
                 exit(1);
         }
@@ -752,20 +741,20 @@ static int fat_fill_fs(const char *bfile_name, struct fat_fs *fs)
         if (err) {
                 if (errno != ENOENT) {
                         err = -errno;
-                        fat_error("%s: could not access %s: %s", __func__,
+                        fat_trace("%s: could not access %s: %s", __func__,
                                   bfile_name, strerror(errno));
                         goto out_err;
                 }
                 fd = open(bfile_name, O_RDWR|O_CREAT|O_EXCL, 0644);
                 if (fd < 0) {
                         err = -errno;
-                        fat_error("%s: could not open %s for creation: %s",
+                        fat_trace("%s: could not open %s for creation: %s",
                                   __func__, bfile_name, strerror(errno));
                         goto out_err;
                 }
                 err = fat_mkfs(fd, FAT_DEFAULT_FS_SIZE);
                 if (err) {
-                        fat_error("%s: mkfs failed: %s", __func__,
+                        fat_trace("%s: mkfs failed: %s", __func__,
                                   strerror(-err));
                         goto out_close;
                 }
@@ -773,7 +762,7 @@ static int fat_fill_fs(const char *bfile_name, struct fat_fs *fs)
                 fd = open(bfile_name, O_RDWR);
                 if (fd < 0) {
                         err = -errno;
-                        fat_error("%s: could not open %s: %s",
+                        fat_trace("%s: could not open %s: %s",
                                   __func__, bfile_name, strerror(errno));
                         goto out_err;
                 }
@@ -786,7 +775,7 @@ static int fat_fill_fs(const char *bfile_name, struct fat_fs *fs)
         sb = malloc(sizeof *sb);
         if (!sb) {
                 err = -ENOMEM;
-                fat_error("%s: could not allocate superblock", __func__);
+                fat_trace("%s: could not allocate superblock", __func__);
                 goto out_close;
         }
 
@@ -803,7 +792,7 @@ static int fat_fill_fs(const char *bfile_name, struct fat_fs *fs)
         fat = malloc(fat_size);
         if (!fat) {
                 err = -ENOMEM;
-                fat_error("%s: failed to allocate fat of size %u",
+                fat_trace("%s: failed to allocate fat of size %u",
                           __func__, fat_size);
                 goto out_free_sb;
         }
@@ -817,7 +806,7 @@ static int fat_fill_fs(const char *bfile_name, struct fat_fs *fs)
         flist_vec = malloc(flist_cap * sizeof *flist_vec);
         if (!flist_vec) {
                 err = -ENOMEM;
-                fat_error("%s: failed to allocate freelist of size %u",
+                fat_trace("%s: failed to allocate freelist of size %u",
                           __func__, flist_cap);
                 goto out_free_fat;
         }
@@ -827,7 +816,7 @@ static int fat_fill_fs(const char *bfile_name, struct fat_fs *fs)
         fs->f_flist_size = 0;
 
         if (fs->f_fat[0] == FAT_FREE_MARK) {
-                fat_error("%s: cluster 0 should be alloc'd for root dentry",
+                fat_trace("%s: cluster 0 should be alloc'd for root dentry",
                           __func__);
                 err = -EIO;
                 goto out_free_freelist;
@@ -867,7 +856,7 @@ out_close:
         close(fd);
 out_err:
         memset(fs, 0, sizeof *fs);
-        fat_error("%s: %s", __func__, strerror(-err));
+        fat_trace("%s: %s", __func__, strerror(-err));
         return err;
 }
 
@@ -1089,7 +1078,7 @@ static int fat_write_new_dentry(struct fat_dentry *dentry,
         }
 
         if (err)
-                fat_error("%s: %s", __func__, strerror(-err));
+                fat_trace("%s: %s", __func__, strerror(-err));
         else if (fat_dentry_is_dir(dentry)) {
                 d = fat_diter_get(parent);
                 d->d_nlink++;
@@ -1292,7 +1281,7 @@ static int fat_getattr(const char *path, struct stat *stbuf)
                 stbuf->st_mode |= S_IFLNK;
                 stbuf->st_mode |= S_IRWXU|S_IRWXG|S_IRWXO;
         } else
-                fat_error("%s: unknown file type, flags=0x%xu", __func__,
+                fat_trace("%s: unknown file type, flags=0x%xu", __func__,
                           d.d_flags);
 
         stbuf->st_blksize = FAT_BLOCK_SIZE;
@@ -1569,7 +1558,7 @@ static int fat_readlink(const char *path, char *buf, size_t size)
         if (!fat_dentry_is_link(&d))
                 return -EINVAL; /* xxx: better err? */
         if (d.d_idx == FAT_END_MARK) {
-                fat_error("%s: empty symlink", __func__);
+                fat_trace("%s: empty symlink", __func__);
                 return -EIO;
         }
 
