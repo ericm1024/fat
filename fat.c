@@ -367,11 +367,10 @@ static bool fat_path_eat_level(const char **pathp,
  *
  * all writes go through this function.
  */ 
-static int __fat_write_blocks(off_t offset, int fd, size_t size,
-                              const void *block)
+static void __fat_write_blocks(off_t offset, int fd, size_t size,
+                               const void *block)
 {
         ssize_t ret = pwrite(fd, block, size, offset);
-        int err = 0;
 
         /*
          * assignment requires we treat backing deivce like a disk, so
@@ -381,15 +380,14 @@ static int __fat_write_blocks(off_t offset, int fd, size_t size,
         assert(offset%FAT_BLOCK_SIZE == 0);
 
         if (ret < 0) {
-                err = -errno;
                 fat_error("%s: pwrite failed with %s", __func__,
                           strerror(errno));
+                exit(1);
         } else if ((size_t)ret < size) {
                 fat_error("%s: short pwrite at offset=%ld size=%ld",
                           __func__, offset, ret);
-                err = -EIO; /* XXX: better error? */
+                exit(1);
         }
-        return err;
 }
 
 /*
@@ -399,13 +397,11 @@ static int __fat_write_blocks(off_t offset, int fd, size_t size,
  * @fs       fat filesystem instance
  * @size     number of bytes to read
  * @block    input buffer
- *
- * @returns 0 on success, negative values on error.
  */ 
-static int fat_write_blocks(off_t offset, const struct fat_fs *fs,
-                            size_t size, const void *block)
+static void fat_write_blocks(off_t offset, const struct fat_fs *fs,
+                             size_t size, const void *block)
 {
-        return __fat_write_blocks(offset, fs->f_fd, size, block);
+        __fat_write_blocks(offset, fs->f_fd, size, block);
 }
 
 /*
@@ -417,14 +413,11 @@ static int fat_write_blocks(off_t offset, const struct fat_fs *fs,
  * @fs       fat filesystem instance
  * @size     number of bytes to read
  * @block    output buffer
- *
- * @returns 0 on success, negative values on error.
  */ 
-static int fat_read_blocks(off_t offset, const struct fat_fs *fs,
-                           size_t size, void *block)
+static void fat_read_blocks(off_t offset, const struct fat_fs *fs,
+                            size_t size, void *block)
 {
         ssize_t ret = pread(fs->f_fd, block, size, offset);
-        int err = 0;
 
         /*
          * assignment requires we treat backing deivce like a disk, so
@@ -434,15 +427,14 @@ static int fat_read_blocks(off_t offset, const struct fat_fs *fs,
         assert(offset%FAT_BLOCK_SIZE == 0);
 
         if (ret < 0) {
-                err = -errno;
                 fat_error("%s: pread failed with %s", __func__,
                           strerror(errno));
+                exit(1);
         } else if ((size_t)ret < size) {
                 fat_error("%s: short pread at offset=%ld size=%ld",
                           __func__, offset, ret);
-                err = -EIO; /* XXX: better error? */
+                exit(1);
         }
-        return err;
 }
 
 /*
@@ -450,20 +442,16 @@ static int fat_read_blocks(off_t offset, const struct fat_fs *fs,
  *
  * @cluster  the in-memory representation of the cluster to read
  * @fs       fat instance
- *
- * @returns 0 on success, or negative errors on failure, including if the
- * cluster has not been allocated
  */ 
-static int fat_read_cluster(struct fat_cluster *cluster,
-                            const struct fat_fs *fs)
+static void fat_read_cluster(struct fat_cluster *cluster,
+                             const struct fat_fs *fs)
 {
         off_t offset = sizeof(struct fat_superblock)
                 + sizeof(uint32_t)*fs->f_sb->s_fat_entries
                 + FAT_CLUSTER_SIZE*cluster->c_idx;
 
-        if (!fat_cluster_is_allocated(fs, cluster->c_idx))
-                return -ENOENT;
-        return fat_read_blocks(offset, fs, FAT_CLUSTER_SIZE, &cluster->c_fbuf);
+        assert(fat_cluster_is_allocated(fs, cluster->c_idx));
+        fat_read_blocks(offset, fs, FAT_CLUSTER_SIZE, &cluster->c_fbuf);
 }
 
 /*
@@ -471,25 +459,21 @@ static int fat_read_cluster(struct fat_cluster *cluster,
  *
  * @cluster  The cluster to write
  * @fs       fat instance to write to
- *
- * @returns 0 on success, ngative errors on falure
  */ 
-static int fat_write_cluster(const struct fat_cluster *cluster,
+static void fat_write_cluster(const struct fat_cluster *cluster,
                              const struct fat_fs *fs)
 {
         off_t offset = sizeof(struct fat_superblock)
                 + sizeof(uint32_t)*fs->f_sb->s_fat_entries
                 + FAT_CLUSTER_SIZE*cluster->c_idx;
 
-        if (!fat_cluster_is_allocated(fs, cluster->c_idx))
-                return -ENOENT;
-        return fat_write_blocks(offset, fs, FAT_CLUSTER_SIZE, &cluster->c_fbuf);
+        assert(fat_cluster_is_allocated(fs, cluster->c_idx));
+        fat_write_blocks(offset, fs, FAT_CLUSTER_SIZE, &cluster->c_fbuf);
 }
 
 static int fat_diter_begin(struct fat_diter *di,
                            const struct fat_dentry *parent)
 {
-        int ret;
         uint32_t d_idx = parent ? parent->d_idx : 0;
 
         di->di_cluster = malloc(sizeof *di->di_cluster);
@@ -501,11 +485,7 @@ static int fat_diter_begin(struct fat_diter *di,
                 return -ENOENT;
         }        
         di->di_cluster->c_idx = d_idx;
-        ret = fat_read_cluster(di->di_cluster, di->di_fs);
-        if (ret) {
-                free(di->di_cluster);
-                return ret;
-        }        
+        fat_read_cluster(di->di_cluster, di->di_fs);
         di->di_d_index = 0;
         return 0;
 }
@@ -517,33 +497,26 @@ static struct fat_dentry *fat_diter_get(const struct fat_diter *di)
 
 static int fat_diter_advance_cluster(struct fat_diter *di)
 {
-        int ret;
         uint32_t idx = fat_follow_chain(di->di_cluster->c_idx,
                                         di->di_fs);
         if (idx == FAT_END_MARK)
                 return -ENOENT;
         di->di_cluster->c_idx = idx;
-        ret = fat_read_cluster(di->di_cluster, di->di_fs);
-        if (ret)
-                return ret;
-        di->di_d_index = 0;
-        return ret;
-}
-
-static int fat_diter_advance_force(struct fat_diter *di)
-{
-        int ret;
-        if (di->di_d_index < FAT_DENTRIES_PER_CLUSTER - 1) {
-                di->di_d_index++;
-                return 0;
-        }
-        di->di_cluster->c_idx = fat_follow_chain(di->di_cluster->c_idx,
-                                                 di->di_fs);
-        ret = fat_read_cluster(di->di_cluster, di->di_fs);
-        if (ret)
-                return ret;
+        fat_read_cluster(di->di_cluster, di->di_fs);
         di->di_d_index = 0;
         return 0;
+}
+
+static void fat_diter_advance_force(struct fat_diter *di)
+{
+        if (di->di_d_index < FAT_DENTRIES_PER_CLUSTER - 1)
+                di->di_d_index++;
+        else {
+                di->di_cluster->c_idx = fat_follow_chain(di->di_cluster->c_idx,
+                                                         di->di_fs);
+                fat_read_cluster(di->di_cluster, di->di_fs);
+                di->di_d_index = 0;
+        }
 }
         
 static int fat_diter_advance(struct fat_diter *di)
@@ -551,7 +524,8 @@ static int fat_diter_advance(struct fat_diter *di)
         struct fat_dentry *d = fat_diter_get(di);
         if (fat_dentry_is_last(d))
                 return -ENOENT;
-        return fat_diter_advance_force(di);
+        fat_diter_advance_force(di);
+        return 0;
 }
 
 static void fat_diter_end(struct fat_diter *di)
@@ -580,9 +554,9 @@ static int fat_diter_alloc_cluster(struct fat_diter *diter)
         return fat_alloc_cluster(diter->di_cluster->c_idx, diter->di_fs, NULL);
 }
 
-static int fat_diter_commit(const struct fat_diter *diter)
+static void fat_diter_commit(const struct fat_diter *diter)
 {
-        return fat_write_cluster(diter->di_cluster, diter->di_fs);
+        fat_write_cluster(diter->di_cluster, diter->di_fs);
 }
 
 /*
@@ -724,9 +698,7 @@ static int fat_mkfs(int fd, size_t size)
 
         fat_trace("%s: about to write superblock", __func__);
         
-        err = __fat_write_blocks(0, fd, FAT_BLOCK_SIZE, sb);
-        if (err)
-                return err;
+        __fat_write_blocks(0, fd, FAT_BLOCK_SIZE, sb);
 
         /*
          * write the root dentry. we have to do this "by hand" because
@@ -742,17 +714,16 @@ static int fat_mkfs(int fd, size_t size)
         root_dentry->d_fsize = 0;
         root_dentry->d_nlink = 2;
 
-        err = __fat_write_blocks(nr_fat_entries*sizeof(uint32_t)
-                                 + FAT_BLOCK_SIZE, fd,
-                                 sizeof cluster.c_dentries,
-                                 &cluster.c_dentries);
-        if (err)
-                return err;
+        __fat_write_blocks(nr_fat_entries*sizeof(uint32_t)
+                           + FAT_BLOCK_SIZE, fd,
+                           sizeof cluster.c_dentries,
+                           &cluster.c_dentries);
 
         memset(fat_block, 0, sizeof fat_block);
         fat_block[0] = FAT_END_MARK;
-        return __fat_write_blocks(FAT_BLOCK_SIZE, fd, FAT_BLOCK_SIZE,
-                                  fat_block);
+        __fat_write_blocks(FAT_BLOCK_SIZE, fd, FAT_BLOCK_SIZE,
+                           fat_block);
+        return 0;
 }
 
 /*
@@ -842,10 +813,8 @@ static int fat_fill_fs(const char *bfile_name, struct fat_fs *fs)
                 fat_error("%s: could not allocate superblock", __func__);
                 goto out_close;
         }
-        err = fat_read_blocks(0, fs, FAT_BLOCK_SIZE, sb);
-        if (err)
-                goto out_free_sb;
 
+        fat_read_blocks(0, fs, FAT_BLOCK_SIZE, sb);
         err = fat_verify_sb(sb);
         if (err)
                 goto out_free_sb;
@@ -863,10 +832,7 @@ static int fat_fill_fs(const char *bfile_name, struct fat_fs *fs)
                 goto out_free_sb;
         }
 
-        err = fat_read_blocks(FAT_BLOCK_SIZE, fs, fat_size, fat);
-        if (err)
-                goto out_free_fat;
-
+        fat_read_blocks(FAT_BLOCK_SIZE, fs, fat_size, fat);
         fs->f_fat = fat;
         fat_trace("%s: read fat with %u entries", __func__, sb->s_fat_entries);
 
@@ -936,36 +902,22 @@ out_err:
  * @idx   The index in the fat to change.
  * @new   The new value to write at that index.
  * @fs    The filesystem instance to modify.
- *
- * @return We don't return anything here because it's difficult to
- * reason about what to "un-modify" if a IO fails during a fat modification,
- * so if an IO does fail we just yell loudly
  */ 
 static void fat_modify_fat(uint32_t idx, uint32_t new, struct fat_fs *fs)
 {
-        int ret;
         ptrdiff_t fat_off = FAT_BLOCK_SIZE*((idx*sizeof idx)/FAT_BLOCK_SIZE);
         off_t file_off = fat_off + FAT_BLOCK_SIZE; /* account for sb */
         assert(idx < fs->f_sb->s_fat_entries);
 
-//        fat_trace("%s: committing fat change at idx=%u: old=%u, new=%u, "
-//                  "file_off=%lu", __func__, idx, fs->f_fat[idx],
-//                  new, file_off);
-
         fs->f_fat[idx] = new;
-        ret = fat_write_blocks(file_off, fs, FAT_BLOCK_SIZE,
-                               (uint8_t *)fs->f_fat + fat_off);
-
-        /* XXX: don't be lazy here, actually handle this */
-        if (ret)
-                fat_error("%s: write failed. This error is unhandled!",
-                          __func__);
+        fat_write_blocks(file_off, fs, FAT_BLOCK_SIZE,
+                         (uint8_t *)fs->f_fat + fat_off);
 }
 
 /* write out the superblock */ 
-static int fat_commit_sb(const struct fat_fs *fs)
+static void fat_commit_sb(const struct fat_fs *fs)
 {
-        return fat_write_blocks(0, fs, FAT_BLOCK_SIZE, fs->f_sb);
+        fat_write_blocks(0, fs, FAT_BLOCK_SIZE, fs->f_sb);
 }
 
 /*
@@ -982,7 +934,6 @@ static int fat_commit_sb(const struct fat_fs *fs)
 static int fat_alloc_cluster(uint32_t parent, struct fat_fs *fs, uint32_t *out)
 {
         uint32_t new_cl;
-        int err;
 
         if (!fat_has_free_clusters(fs))
                 return -ENOSPC;
@@ -997,14 +948,10 @@ static int fat_alloc_cluster(uint32_t parent, struct fat_fs *fs, uint32_t *out)
 
         fs->f_sb->s_free--;
         fs->f_sb->s_last_allocd = new_cl;
-        err = fat_commit_sb(fs);
-        if (err)
-                /* xxx: metadata inconsistency */
-                return err;
+        fat_commit_sb(fs);
         
         if (out)
                 *out = new_cl;
-//        fat_trace("%s: allocated cluster %u", __func__, new_cl);
         return 0;
 }
 
@@ -1019,8 +966,6 @@ static int fat_alloc_cluster(uint32_t parent, struct fat_fs *fs, uint32_t *out)
 static int fat_free_cluster(uint32_t idx, struct fat_fs *fs)
 {
         int err;
-
-//        fat_trace("%s: freeing cluster %u", __func__, idx);
         
         fat_modify_fat(idx, FAT_FREE_MARK, fs);
         err = fat_flist_push(fs, idx);
@@ -1028,12 +973,8 @@ static int fat_free_cluster(uint32_t idx, struct fat_fs *fs)
                 return err;
         
         fs->f_sb->s_free++;
-        err = fat_commit_sb(fs);
-        if (err) {
-                fs->f_sb->s_free--;
-                return err;
-        }
-        return err;
+        fat_commit_sb(fs);
+        return 0;
 }
 
 /*
@@ -1059,21 +1000,16 @@ static int fat_write_new_dentry(struct fat_dentry *dentry,
                                 struct fat_diter *parent)
 {
         struct fat_diter diter, next;
-        int err;
+        int err = 0;
         struct fat_dentry *d;
 
         diter.di_fs = parent->di_fs;
-
-//        fat_trace("%s: d_name=%s, parent_idx=%u", __func__, dentry->d_name,
-//                  fat_diter_get(parent)->d_idx);
 
         d = fat_diter_get(parent);
         err = fat_diter_begin(&diter, d);
         if (err) {
                 if (err != -ENOENT)
                         return err;
-
-//                fat_trace("%s: case 1, empty parent dir", __func__);
 
                 /* case (1): parent directory is empty */
                 err = fat_alloc_cluster(FAT_END_MARK, diter.di_fs, &d->d_idx);
@@ -1086,15 +1022,13 @@ static int fat_write_new_dentry(struct fat_dentry *dentry,
                 d = fat_diter_get(&diter);
                 *d = *dentry;
                 fat_dentry_set_flag(FAT_DF_LAST, d);
-                err = fat_diter_commit(&diter);
-                if (err)
-                        goto out_free_diter;
+                fat_diter_commit(&diter);
                 /*
                  * now that we've for sure written out a 'last' dentry in the
                  * new cluster, we can commit the parent with the new cluster
                  * index
                  */
-                err = fat_diter_commit(parent);
+                fat_diter_commit(parent);
                 goto out_free_diter;
         }
         
@@ -1103,9 +1037,8 @@ static int fat_write_new_dentry(struct fat_dentry *dentry,
 
                 if (fat_dentry_is_del(d)) {
                         /* case (2): we found a deleted dentry */
-//                        fat_trace("%s: case 2, deleted dentry", __func__);
                         *d = *dentry;
-                        err = fat_diter_commit(&diter);
+                        fat_diter_commit(&diter);
                         goto out_free_diter;
                 } else if (fat_dentry_is_last(d)) {
                         /*
@@ -1134,9 +1067,6 @@ static int fat_write_new_dentry(struct fat_dentry *dentry,
                         if (diter.di_d_index == FAT_DENTRIES_PER_CLUSTER - 1) {
                                 struct fat_dentry *slot;
 
-//                                fat_trace("%s: case 3a, full cluster",
-//                                          __func__);
-
                                 /* 1: allocate a cluster */
                                 err = fat_diter_alloc_cluster(&diter);
                                 if (err)
@@ -1149,35 +1079,25 @@ static int fat_write_new_dentry(struct fat_dentry *dentry,
                                  * over the 'last' dentry, which normally
                                  * is an error
                                  */
-                                err = fat_diter_advance_force(&next);
-                                if (err)
-                                        goto out_free_next;
+                                fat_diter_advance_force(&next);
                                 slot = fat_diter_get(&next);
                                 *slot = *dentry;
 
                                 /* 2: mark the new dentry as last */
                                 fat_dentry_set_flag(FAT_DF_LAST, slot);
-                                err = fat_diter_commit(&next);
-                                if (err)
-                                        /* XXX: leaking a cluster here */
-                                        goto out_free_next;
+                                fat_diter_commit(&next);
 
                                 /*
                                  * 3: commit marking the old last dentry as
                                  * 'not last'
                                  */
                                 fat_dentry_clear_flag(FAT_DF_LAST, d);
-                                err = fat_diter_commit(&diter);
-                                if (err)
-                                        goto out_free_next;
+                                fat_diter_commit(&diter);
                                 d = fat_diter_get(parent);
                                 d->d_fsize += FAT_CLUSTER_SIZE;
-                                err = fat_diter_commit(parent);
+                                fat_diter_commit(parent);
                                 goto out_free_next;
                         } else {
-//                                fat_trace("%s: case 3b, partial cluster",
-//                                          __func__);
-                                
                                 fat_dentry_clear_flag(FAT_DF_LAST, d);
                                 err = fat_diter_advance(&diter);
                                 /* should never error here */
@@ -1185,7 +1105,7 @@ static int fat_write_new_dentry(struct fat_dentry *dentry,
                                 d = fat_diter_get(&diter);
                                 *d = *dentry;
                                 fat_dentry_set_flag(FAT_DF_LAST, d);
-                                err = fat_diter_commit(&diter);
+                                fat_diter_commit(&diter);
                                 goto out_free_diter;
                         }
                 } else {
@@ -1204,7 +1124,7 @@ out_free_diter:
         else if (fat_dentry_is_dir(dentry)) {
                 d = fat_diter_get(parent);
                 d->d_nlink++;
-                err = fat_diter_commit(parent);
+                fat_diter_commit(parent);
         }
         return err;
 }
@@ -1257,14 +1177,13 @@ static size_t fat_count_dentries(struct fat_cluster *cl)
 }
 
 /* merge two clusters into one and do the appropriate cleanup in the fat */
-static int fat_merge_dir_clusters(struct fat_diter *target,
-                                  struct fat_diter *victim)
+static void fat_merge_dir_clusters(struct fat_diter *target,
+                                   struct fat_diter *victim)
 {
         struct fat_cluster *tcl = target->di_cluster;
         struct fat_cluster *vcl = victim->di_cluster;
         uint32_t vidx = vcl->c_idx;
         struct fat_fs *fs = target->di_fs;
-        int err;
         struct fat_cluster new;
         new.c_idx = tcl->c_idx;
         size_t new_idx = 0, i;
@@ -1296,15 +1215,14 @@ static int fat_merge_dir_clusters(struct fat_diter *target,
                 fat_dentry_set_flag(FAT_DF_LAST, &new.c_dentries[--new_idx]);
         else
                 while (new_idx < FAT_DENTRIES_PER_CLUSTER)
-                        fat_dentry_set_flag(FAT_DF_DEL, &new.c_dentries[new_idx++]);
+                        fat_dentry_set_flag(FAT_DF_DEL,
+                                            &new.c_dentries[new_idx++]);
         memcpy(tcl, &new, sizeof new);
-        err = fat_diter_commit(target);
-        if (err)
-                return err;
+        fat_diter_commit(target);
 
         /* remove the victim cluster from the cluster chain */
         fat_modify_fat(tcl->c_idx, fat_follow_chain(vidx, fs), fs);
-        return fat_free_cluster(vidx, fs);
+        fat_free_cluster(vidx, fs);
 }
 
 /*
@@ -1330,9 +1248,7 @@ static int fat_delete_dentry(struct fat_diter *diter,
 
         /* mark the dentry as deleted */
         fat_dentry_set_flag(FAT_DF_DEL, d);
-        err = fat_diter_commit(diter);
-        if (err)
-                return err;
+        fat_diter_commit(diter);
 
         /* get the parent dentry */
         ppath = fat_get_ppath(path);
@@ -1356,20 +1272,16 @@ static int fat_delete_dentry(struct fat_diter *diter,
                 if (fat_count_dentries(next.di_cluster)
                     + fat_count_dentries(diter->di_cluster)
                     <= FAT_DENTRIES_PER_CLUSTER) {
-                        err = fat_merge_dir_clusters(diter, &next);
+                        fat_merge_dir_clusters(diter, &next);
                         pd->d_fsize -= FAT_CLUSTER_SIZE;
-                        err = fat_diter_commit(&parent);
-                        if (err)
-                                goto out_free_next;
+                        fat_diter_commit(&parent);
                 }
         }
 
         /* decriment d_nlink in parent, if necessary */
         if (is_dir) {
                 pd->d_nlink--;
-                err = fat_diter_commit(&parent);
-                if (err)
-                        goto out_free_next;
+                fat_diter_commit(&parent);
         }
 
         /* empty a directory if we're removing the last dentry */
@@ -1380,9 +1292,7 @@ static int fat_delete_dentry(struct fat_diter *diter,
                 pd->d_idx = FAT_END_MARK;
                 assert(pd->d_fsize == FAT_CLUSTER_SIZE);
                 pd->d_fsize = 0;
-                err = fat_diter_commit(&parent);
-                if (err)
-                        goto out_free_ppath;
+                fat_diter_commit(&parent);
 
                 /* free the corresponding cluster */
                 err = fat_free_cluster(idx, fs);
@@ -1546,7 +1456,8 @@ out_commit:
         if (size == 0)
                 d->d_idx = FAT_END_MARK;
         d->d_fsize = size;
-        return fat_diter_commit(diter);
+        fat_diter_commit(diter);
+        return err;
 }
 
 static int fat_truncate(const char *path, off_t size)
@@ -1615,9 +1526,7 @@ static int fat_read(const char *path, char *buf, size_t size, off_t offset,
                 if (bytes_to_copy > size - read)
                         bytes_to_copy = size - read;
 
-                err = fat_read_cluster(&cluster, fs);
-                if (err)
-                        return read ? read : err;
+                fat_read_cluster(&cluster, fs);
                 memcpy(buf + read, cluster.c_fbuf + cls_start, bytes_to_copy);
                 cur_off += bytes_to_copy;
                 read += bytes_to_copy;
@@ -1676,17 +1585,9 @@ static int fat_write(const char *path, const char *buf, size_t size,
                 if (bytes_to_copy > size - written)
                         bytes_to_copy = size - written;
 
-                err = fat_read_cluster(&cl, fs);
-                if (err)
-                        return written ? written : err;
-
-                fat_trace("%s: c_idx=%u, bytes_to_copy=%zu, cls_start=%zu, cur_off=%lu",
-                          __func__, cl.c_idx, bytes_to_copy, cls_start, cur_off);
-
+                fat_read_cluster(&cl, fs);
                 memcpy(cl.c_fbuf + cls_start, buf + written, bytes_to_copy);
-                err = fat_write_cluster(&cl, fs);
-                if (err)
-                        return written ? written : err;
+                fat_write_cluster(&cl, fs);
 
                 cur_off += bytes_to_copy;
                 written += bytes_to_copy;
@@ -1715,9 +1616,8 @@ static int fat_readlink(const char *path, char *buf, size_t size)
         }
 
         cl.c_idx = d.d_idx;
-        err = fat_read_cluster(&cl, fs);
-        if (err)
-                return err;
+        fat_read_cluster(&cl, fs);
+
         if (size > d.d_fsize)
                 size = d.d_fsize;
         else
@@ -1917,9 +1817,7 @@ static int fat_symlink(const char *to, const char *from)
         memset(&cl, 0, sizeof cl);
         memcpy(cl.c_fbuf, to, to_len);
         cl.c_idx = d.d_idx;
-        err = fat_write_cluster(&cl, fs);
-        if (err)
-                goto out;
+        fat_write_cluster(&cl, fs);
 
         /* commit the dentry */
         err = fat_get_diter(ppath, &global_fat_fs, &diter);
