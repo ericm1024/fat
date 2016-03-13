@@ -175,28 +175,31 @@ static bool fat_cluster_is_allocated(const struct fat_fs *fs, uint32_t idx)
                 && fs->f_fat[idx] != FAT_FREE_MARK;
 }
 
+/* is this dentry deleted? */
+static bool fat_dentry_is_del(const struct fat_dentry *d)
+{
+        return d->d_flags & FAT_DF_DEL;
+}
+
 /* is this dentry is a symlink? */
 static bool fat_dentry_is_link(const struct fat_dentry *d)
 {
+        assert(!fat_dentry_is_del(d));
         return d->d_flags & FAT_DF_LINK;
 }
 
 /* is this dentry a file? */
 static bool fat_dentry_is_file(const struct fat_dentry *d)
 {
+        assert(!fat_dentry_is_del(d));
         return d->d_flags & FAT_DF_FILE;
 }
 
 /* is this dentry another dentry? */
 static bool fat_dentry_is_dir(const struct fat_dentry *d)
 {
+        assert(!fat_dentry_is_del(d));
         return d->d_flags & FAT_DF_DENTRY;
-}
-
-/* is this dentry deleted? */
-static bool fat_dentry_is_del(const struct fat_dentry *d)
-{
-        return d->d_flags & FAT_DF_DEL;
 }
 
 /* is this dentry the last dentry in a directory? */
