@@ -1,14 +1,14 @@
 /*
- * CS137 fat
+ * CS137 fat, assignment 2.
  *
  * author: Eric Mueller <emueller@hmc.edu>
- */
-
-/*
- * issues:
- *     rare bug where a directory has ->d_size == 512 (i.e. the directory has
- *     one cluster allocated for it), but ->d_nlink == 2, and readdir returns
- *     nothing (not even . and ..). Not sure what causes this...
+ *
+ * I didn't have time to fully polish this assignment, so there are definitely
+ * bugs and the code is kind of a mess in some places. The only bug that I
+ * know about concretely is a rare bug where a directory has ->d_size == 512
+ * (i.e. the directory has one cluster allocated for it), but ->d_nlink == 2,
+ * and readdir returns nothing (not even . and ..). There are probably plenty of
+ * other bugs as well...
  */ 
 
 #define FUSE_USE_VERSION 26
