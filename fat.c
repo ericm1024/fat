@@ -1788,8 +1788,6 @@ static int fat_statfs(const char *path, struct statvfs *stbuf)
         struct fat_fs *fs = &global_fat_fs;
         size_t blks_per_cls = FAT_CLUSTER_SIZE/FAT_BLOCK_SIZE;
 
-        (void)path;
-
         memset(stbuf, 0, sizeof *stbuf);
         stbuf->f_bsize = FAT_BLOCK_SIZE;
         stbuf->f_blocks = fs->f_sb->s_fat_entries*blks_per_cls;
@@ -1802,21 +1800,18 @@ static int fat_statfs(const char *path, struct statvfs *stbuf)
 
 static int fat_release(const char *path, struct fuse_file_info *fi)
 {
-        (void)path;
         return 0;
 }
 
 static int fat_fgetattr(const char *path, struct stat *stbuf,
                         struct fuse_file_info *fi)
 {
-        (void)fi;
         return fat_getattr(path, stbuf);
 }
 
 static int fat_create(const char *path, mode_t mode,
                       struct fuse_file_info *fi)
 {
-        (void)fi;
         return fat_mknod(path, mode, 0);
 }
 
