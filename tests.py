@@ -7,19 +7,59 @@ import stat
 import itertools
 import random
 import string
-
-# readlink
-# statfs
-# symlink
-# getattr
-# access
-# readdir
+import subprocess
 
 def dir_has_entry(entry, directory='.'):
     entries=os.listdir(directory)
     return entry in entries
 
-class CreateUnlinkTest(unittest.TestCase):
+class FatTest(unittest.TestCase):
+    TEST_ROOT=os.path.abspath(os.path.dirname(__file__))
+    MNT_DIR_NAME="mnt"
+    DISK_NAME="fat.dat"
+    MNT_DIR_PATH=TEST_ROOT+'/'+MNT_DIR_NAME
+    DISK_PATH=TEST_ROOT+'/'+DISK_NAME
+
+    def rm(self, name):
+        try:
+            if os.path.isfile(name):
+                os.unlink(name)
+            else:
+                os.rmdir(name)
+        except OSError as e:
+            pass
+
+    def setUp(self, mount=True):
+        # remove the previous backing store if one exists
+        self.rm(self.DISK_PATH)
+
+        # unmount any old instance if one exists
+        self.unmount()
+
+        # mount the filesystem
+        if mount:
+            self.mount()
+
+    def tearDown(self):
+        self.unmount()
+        self.rm(self.MNT_DIR_PATH)
+        self.rm(self.DISK_PATH)
+
+    def mount(self):
+        # make the mount directory if it doesn't exist
+        if not self.MNT_DIR_NAME in os.listdir(self.TEST_ROOT):
+            os.mkdir(self.MNT_DIR_PATH)
+
+        ret=subprocess.call("./fat -s "+self.MNT_DIR_PATH, shell=True)
+        self.assertEqual(ret, 0)
+        os.chdir(self.MNT_DIR_PATH)
+
+    def unmount(self):
+        os.chdir(self.TEST_ROOT)
+        subprocess.call("fusermount -u "+self.MNT_DIR_PATH, shell=True,
+                        stdout=open(os.devnull), stderr=open(os.devnull))
+
+class CreateUnlinkTest(FatTest):
     def create_portion(self, name):
         os.mknod(name)
         stat=os.stat(name)
@@ -52,19 +92,20 @@ class CreateUnlinkTest(unittest.TestCase):
         self.do_test_many(1024)
 
 # this test case is abusive
-class MkdirRmdirTest(unittest.TestCase):
+class MkdirRmdirTest(FatTest):
     def create_portion(self, name, d):
-        os.mkdir(d+name)
-        stat=os.stat(d+name)
+        path=os.path.join(d,name)
+        os.mkdir(path)
+        stat=os.stat(path)
         self.assertEqual(stat.st_nlink, 2)
         self.assertEqual(stat.st_size, 0)
         self.assertTrue(dir_has_entry(name, d))
 
     def unlink_portion(self, name, d):
-        os.rmdir(d+name)
+        os.rmdir(os.path.join(d,name))
         self.assertFalse(dir_has_entry(name, d))
     
-    def do_test_many(self, nr, depth=0, d='./'):
+    def do_test_many(self, nr, depth=0, d='.'):
         names=[str(i) for i in range(nr)]
         nlink=os.stat(d).st_nlink
         for name in names:
@@ -73,7 +114,7 @@ class MkdirRmdirTest(unittest.TestCase):
 
         if depth > 0:
             for i in range(nr):
-                self.do_test_many(nr, depth-1, d+names[i]+'/')
+                self.do_test_many(nr, depth-1, os.path.join(d,names[i]))
 
         for i in range(len(names)):
             entries=os.listdir(d)
@@ -105,7 +146,7 @@ class MkdirRmdirTest(unittest.TestCase):
 def get_rand_data(length):
        return ''.join(random.choice(string.lowercase) for i in range(length))
         
-class ReadWriteTest(unittest.TestCase):
+class ReadWriteTest(FatTest):
 
     def file_size(self, name):
         stat=os.stat(name)
