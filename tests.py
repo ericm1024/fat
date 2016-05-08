@@ -40,10 +40,17 @@ class FatTest(unittest.TestCase):
         if mount:
             self.mount()
 
+        self.free_before=os.statvfs(self.MNT_DIR_PATH).f_bfree
+
     def tearDown(self):
+
+        free_after=os.statvfs(self.MNT_DIR_PATH).f_bfree
+
         self.unmount()
         self.rm(self.MNT_DIR_PATH)
         self.rm(self.DISK_PATH)
+
+        self.assertEqual(self.free_before, free_after)
 
     def mount(self):
         # make the mount directory if it doesn't exist
